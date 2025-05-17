@@ -9,6 +9,9 @@ mod notifications;
 mod requests;
 mod traits;
 
+#[cfg(test)]
+mod test_push_notifications;
+
 use notifications as notification;
 use requests as request;
 
