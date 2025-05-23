@@ -11,8 +11,10 @@ use ty_project::{Db, ProjectDatabase};
 use ruff_db::source::{line_index, source_text};
 use ruff_db::diagnostic::Severity;
 
-
 use super::LSPResult;
+
+#[cfg(test)]
+mod tests;
 
 pub(super) fn clear_diagnostics(uri: &Url, notifier: &Notifier) -> Result<()> {
     notifier
@@ -48,8 +50,6 @@ pub(super) fn compute_diagnostics(snapshot: &DocumentSnapshot, db: &ProjectDatab
         .map(|message| to_lsp_diagnostic(db, message, snapshot.encoding()))
         .collect()
 }
-
-
 
 fn to_lsp_diagnostic(
     db: &dyn Db,

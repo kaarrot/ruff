@@ -5,6 +5,9 @@ mod did_close_notebook;
 mod did_open;
 mod did_open_notebook;
 
+#[cfg(test)]
+mod tests;
+
 pub(super) use did_change::DidChangeTextDocumentHandler;
 pub(super) use did_change_watched_files::DidChangeWatchedFiles;
 pub(super) use did_close::DidCloseTextDocumentHandler;
