@@ -1,7 +1,7 @@
 mod completion;
 mod db;
 mod find_node;
-mod goto;
+pub mod goto;
 mod hover;
 mod inlay_hints;
 mod markup;
@@ -196,6 +196,8 @@ impl HasNavigationTargets for TypeDefinition<'_> {
         })
     }
 }
+
+
 
 #[cfg(test)]
 mod tests {

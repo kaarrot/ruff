@@ -294,7 +294,15 @@ impl<'db> SemanticIndex<'db> {
                 parent_use_def.is_reachable(db, reachability)
             })
     }
-
+    /// Finds the first binding (definition) for a symbol with the given name in the global scope.
+    pub(crate) fn binding_by_name(&self, name: &str) -> Option<Definition<'db>> {
+        let global_scope = crate::semantic_index::symbol::FileScopeId::global();
+        let symbol_table = self.symbol_table(global_scope);
+        let symbol_id = symbol_table.symbol_id_by_name(name)?;
+        let use_def = &self.use_def_maps[global_scope]; // Access UseDefMap directly
+        use_def.first_public_binding(symbol_id)
+}
+    
     /// Returns true if a given AST node is reachable from the start of the scope. For example,
     /// in the following code, expression `2` is reachable, but expressions `1` and `3` are not:
     /// ```py
@@ -551,18 +559,13 @@ mod tests {
     use crate::semantic_index::ast_ids::{HasScopedUseId, ScopedUseId};
     use crate::semantic_index::definition::{Definition, DefinitionKind};
     use crate::semantic_index::symbol::{
-        FileScopeId, Scope, ScopeKind, ScopedSymbolId, SymbolTable,
+        FileScopeId, Scope, ScopeKind, SymbolTable,
     };
     use crate::semantic_index::use_def::UseDefMap;
     use crate::semantic_index::{global_scope, semantic_index, symbol_table, use_def_map};
     use crate::Db;
 
     impl UseDefMap<'_> {
-        fn first_public_binding(&self, symbol: ScopedSymbolId) -> Option<Definition<'_>> {
-            self.public_bindings(symbol)
-                .find_map(|constrained_binding| constrained_binding.binding)
-        }
-
         fn first_binding_at_use(&self, use_id: ScopedUseId) -> Option<Definition<'_>> {
             self.bindings_at_use(use_id)
                 .find_map(|constrained_binding| constrained_binding.binding)

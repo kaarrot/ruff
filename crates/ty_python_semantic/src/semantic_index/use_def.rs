@@ -347,6 +347,11 @@ pub(crate) struct UseDefMap<'db> {
 }
 
 impl<'db> UseDefMap<'db> {
+    pub(crate) fn first_public_binding(&self, symbol: ScopedSymbolId) -> Option<Definition<'db>> {
+        self.public_bindings(symbol)
+            .find_map(|constrained_binding| constrained_binding.binding.clone())
+    }
+
     pub(crate) fn bindings_at_use(
         &self,
         use_id: ScopedUseId,

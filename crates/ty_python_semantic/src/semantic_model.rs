@@ -3,6 +3,8 @@ use ruff_db::source::line_index;
 use ruff_python_ast as ast;
 use ruff_python_ast::{Expr, ExprRef};
 use ruff_source_file::LineIndex;
+use ruff_text_size::TextRange;
+use ruff_text_size::Ranged;
 
 use crate::module_name::ModuleName;
 use crate::module_resolver::{resolve_module, Module};
@@ -10,6 +12,7 @@ use crate::semantic_index::ast_ids::HasScopedExpressionId;
 use crate::semantic_index::semantic_index;
 use crate::types::{binding_type, infer_scope_types, Type};
 use crate::Db;
+
 
 pub struct SemanticModel<'db> {
     db: &'db dyn Db,
@@ -38,6 +41,18 @@ impl<'db> SemanticModel<'db> {
     pub fn resolve_module(&self, module_name: &ModuleName) -> Option<Module> {
         resolve_module(self.db, module_name)
     }
+
+    /// Resolves a variable/function/class name to its definition location in the current file.
+    pub fn resolve_name_definition(
+        &self,
+        name: &str,
+    ) -> Option<(File, TextRange)> {
+        let index = semantic_index(self.db, self.file);
+        // Find the binding for the given name in the current file
+        let binding = index.binding_by_name(name)?;
+        let range = binding.focus_range(self.db).range();
+        Some((self.file, range))
+    }    
 }
 
 pub trait HasType {

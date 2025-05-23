@@ -45,7 +45,6 @@ impl SyncNotificationHandler for DidOpenTextDocumentHandler {
         };
 
         let document = TextDocument::new(text, version).with_language_id(&language_id);
-        let key = session.key_from_url(uri.clone());
         session.open_text_document(uri.clone(), document);
 
         let should_compute_diagnostics = !session.client_capabilities().pull_diagnostics;
