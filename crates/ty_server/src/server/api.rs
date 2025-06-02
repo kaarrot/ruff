@@ -50,7 +50,11 @@ pub(super) fn request(req: server::Request) -> Task {
             req, BackgroundSchedule::LatencySensitive
         ),
         lsp_types::request::Shutdown::METHOD => sync_request_task::<requests::ShutdownHandler>(req),
-
+        requests::GotoDefinitionRequestHandler::METHOD => background_request_task::<
+                    requests::GotoDefinitionRequestHandler,
+        >(
+                req, BackgroundSchedule::Worker
+        ),
         method => {
             tracing::warn!("Received request {method} which does not have a handler");
             let result: Result<()> = Err(Error::new(

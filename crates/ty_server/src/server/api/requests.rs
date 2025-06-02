@@ -4,7 +4,9 @@ mod goto_type_definition;
 mod hover;
 mod inlay_hints;
 mod shutdown;
+mod goto_definition;
 
+pub(super) use goto_definition::GotoDefinitionRequestHandler;
 pub(super) use completion::CompletionRequestHandler;
 pub(super) use diagnostic::DocumentDiagnosticRequestHandler;
 pub(super) use goto_type_definition::GotoTypeDefinitionRequestHandler;

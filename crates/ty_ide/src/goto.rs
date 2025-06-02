@@ -1,5 +1,5 @@
 use crate::find_node::covering_node;
-use crate::{Db, HasNavigationTargets, NavigationTargets, RangedValue};
+use crate::{Db, HasNavigationTargets, NavigationTarget, NavigationTargets, RangedValue};
 use ruff_db::files::{File, FileRange};
 use ruff_db::parsed::{ParsedModule, parsed_module};
 use ruff_python_ast::{self as ast, AnyNodeRef};
@@ -25,6 +25,23 @@ pub fn goto_type_definition(
     );
 
     let navigation_targets = ty.navigation_targets(db);
+
+    Some(RangedValue {
+        range: FileRange::new(file, goto_target.range()),
+        value: navigation_targets,
+    })
+}
+
+pub fn goto_definition(
+    db: &dyn Db,
+    file: File,
+    offset: TextSize,
+) -> Option<RangedValue<NavigationTargets>> {
+    let parsed = parsed_module(db.upcast(), file);
+    let goto_target = find_goto_target(parsed, offset)?;
+
+    // Get the definition target, not the type
+    let navigation_targets = goto_target.navigation_targets(db, file)?;
 
     Some(RangedValue {
         range: FileRange::new(file, goto_target.range()),
@@ -156,6 +173,33 @@ impl<'db> GotoTarget<'db> {
         };
 
         Some(ty)
+    }
+
+    pub(crate) fn navigation_targets(self, db: &dyn Db, current_file: File) -> Option<NavigationTargets> {
+        let model = SemanticModel::new(db.upcast(), current_file);
+        match self {
+            GotoTarget::Expression(expr) => {
+            if let Some(name_expr) = expr.as_name_expr() {
+                if let Some((file, range)) = model.resolve_name_definition(name_expr.id.as_str()) {
+                    return Some(NavigationTargets::single(NavigationTarget {
+                        file,
+                        focus_range: range,
+                        full_range: range,
+                    }));
+                }
+            }
+            // Fallback to type definition as before
+            let ty = expr.inferred_type(&model);
+            let definition = ty.definition(db.upcast())?;
+
+            Some(NavigationTargets::single(NavigationTarget {
+                file: current_file,
+                focus_range: definition.focus_range(db.upcast())?.range(),
+                full_range: definition.full_range(db.upcast())?.range(),
+            }))
+        }
+        _ => None, // TODO: Implement remaining variants
+        }
     }
 }
 
@@ -826,6 +870,33 @@ f(**kwargs<CURSOR>)
           |                 ^
           |
         ");
+    }
+
+    #[test]
+    fn goto_expression_with_utf8_encoding() {
+        let test = cursor_test(
+            r#"
+            x = "test"
+            x<CURSOR>
+            "#,
+        );
+
+        assert_snapshot!(test.goto_type_definition(), @r###"
+        info[goto-type-definition]: Type definition
+         --> main.py:2:13
+          |
+        2 |             x = "test"
+          |             ^
+        3 |             x
+          |
+        info: Source
+         --> main.py:3:13
+          |
+        2 |             x = "test"
+        3 |             x
+          |             ^
+          |
+        "###);
     }
 
     impl CursorTest {

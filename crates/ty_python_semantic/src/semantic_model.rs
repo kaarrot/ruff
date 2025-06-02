@@ -3,6 +3,8 @@ use ruff_db::source::line_index;
 use ruff_python_ast as ast;
 use ruff_python_ast::{Expr, ExprRef, name::Name};
 use ruff_source_file::LineIndex;
+use ruff_text_size::TextRange;
+use ruff_text_size::Ranged;
 
 use crate::Db;
 use crate::module_name::ModuleName;
@@ -40,6 +42,18 @@ impl<'db> SemanticModel<'db> {
         resolve_module(self.db, module_name)
     }
 
+    /// Resolves a variable/function/class name to its definition location in the current file.
+    pub fn resolve_name_definition(
+        &self,
+        name: &str,
+    ) -> Option<(File, TextRange)> {
+        let index = semantic_index(self.db, self.file);
+        // Find the binding for the given name in the current file
+        let binding = index.binding_by_name(name)?;
+        let range = binding.focus_range(self.db).range();
+        Some((self.file, range))
+    }
+    
     /// Returns completions for symbols available in the scope containing the
     /// given expression.
     ///
