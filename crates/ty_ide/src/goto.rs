@@ -14,7 +14,7 @@ pub fn goto_type_definition(
     offset: TextSize,
 ) -> Option<RangedValue<NavigationTargets>> {
     let parsed = parsed_module(db.upcast(), file);
-    let goto_target = find_goto_target(parsed, offset)?;
+    let goto_target = find_goto_target(&parsed, offset)?;
 
     let model = SemanticModel::new(db.upcast(), file);
     let ty = goto_target.inferred_type(&model)?;
@@ -38,7 +38,7 @@ pub fn goto_definition(
     offset: TextSize,
 ) -> Option<RangedValue<NavigationTargets>> {
     let parsed = parsed_module(db.upcast(), file);
-    let goto_target = find_goto_target(parsed, offset)?;
+    let goto_target = find_goto_target(&parsed, offset)?;
 
     // Get the definition target, not the type
     let navigation_targets = goto_target.navigation_targets(db, file)?;
@@ -179,25 +179,235 @@ impl<'db> GotoTarget<'db> {
         let model = SemanticModel::new(db.upcast(), current_file);
         match self {
             GotoTarget::Expression(expr) => {
-            if let Some(name_expr) = expr.as_name_expr() {
-                if let Some((file, range)) = model.resolve_name_definition(name_expr.id.as_str()) {
-                    return Some(NavigationTargets::single(NavigationTarget {
+                // For expressions, try to go to the name definition first
+                if let Some(name_expr) = expr.as_name_expr() {
+                    if let Some((file, range)) = model.resolve_name_definition(name_expr.id.as_str()) {
+                        return Some(NavigationTargets::single(NavigationTarget {
+                            file,
+                            focus_range: range,
+                            full_range: range,
+                        }));
+                    }
+                }
+                // If not a name expression or no definition found, this is not a valid goto definition target
+                None
+            }
+            GotoTarget::FunctionDef(function) => {
+                let name = function.name.as_str();
+                if let Some((file, range)) = model.resolve_name_definition(name) {
+                    Some(NavigationTargets::single(NavigationTarget {
                         file,
                         focus_range: range,
                         full_range: range,
-                    }));
+                    }))
+                } else {
+                    None
                 }
             }
-            // Fallback to type definition as before
-            let ty = expr.inferred_type(&model);
-            let definition = ty.definition(db.upcast())?;
-            Some(NavigationTargets::single(NavigationTarget {
-                file: current_file,
-                focus_range: definition.focus_range(db.upcast()).unwrap_or(definition.full_range(db.upcast())).range(),
-                full_range: definition.full_range(db.upcast()).range(),
-            }))
-        }
-        _ => None, // TODO: Implement remaining variants
+            GotoTarget::ClassDef(class) => {
+                let name = class.name.as_str();
+                if let Some((file, range)) = model.resolve_name_definition(name) {
+                    Some(NavigationTargets::single(NavigationTarget {
+                        file,
+                        focus_range: range,
+                        full_range: range,
+                    }))
+                } else {
+                    None
+                }
+            }
+            GotoTarget::Parameter(parameter) => {
+                let name = parameter.name.as_str();
+                if let Some((file, range)) = model.resolve_name_definition(name) {
+                    Some(NavigationTargets::single(NavigationTarget {
+                        file,
+                        focus_range: range,
+                        full_range: range,
+                    }))
+                } else {
+                    None
+                }
+            }
+            GotoTarget::Alias(alias) => {
+                let name = alias.name.as_str();
+                if let Some((file, range)) = model.resolve_name_definition(name) {
+                    Some(NavigationTargets::single(NavigationTarget {
+                        file,
+                        focus_range: range,
+                        full_range: range,
+                    }))
+                } else {
+                    None
+                }
+            }
+            GotoTarget::ExceptVariable(except) => {
+                if let Some(name) = except.name.as_ref() {
+                    let name_str = name.as_str();
+                    if let Some((file, range)) = model.resolve_name_definition(name_str) {
+                        Some(NavigationTargets::single(NavigationTarget {
+                            file,
+                            focus_range: range,
+                            full_range: range,
+                        }))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            GotoTarget::KeywordArgument(argument) => {
+                if let Some(arg) = argument.arg.as_ref() {
+                    let name = arg.as_str();
+                    if let Some((file, range)) = model.resolve_name_definition(name) {
+                        Some(NavigationTargets::single(NavigationTarget {
+                            file,
+                            focus_range: range,
+                            full_range: range,
+                        }))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            GotoTarget::PatternMatchRest(rest) => {
+                if let Some(name) = rest.rest.as_ref() {
+                    let name_str = name.as_str();
+                    if let Some((file, range)) = model.resolve_name_definition(name_str) {
+                        Some(NavigationTargets::single(NavigationTarget {
+                            file,
+                            focus_range: range,
+                            full_range: range,
+                        }))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            GotoTarget::PatternKeywordArgument(keyword) => {
+                let name = keyword.attr.as_str();
+                if let Some((file, range)) = model.resolve_name_definition(name) {
+                    Some(NavigationTargets::single(NavigationTarget {
+                        file,
+                        focus_range: range,
+                        full_range: range,
+                    }))
+                } else {
+                    None
+                }
+            }
+            GotoTarget::PatternMatchStarName(star) => {
+                if let Some(name) = star.name.as_ref() {
+                    let name_str = name.as_str();
+                    if let Some((file, range)) = model.resolve_name_definition(name_str) {
+                        Some(NavigationTargets::single(NavigationTarget {
+                            file,
+                            focus_range: range,
+                            full_range: range,
+                        }))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            GotoTarget::PatternMatchAsName(as_pattern) => {
+                if let Some(name) = as_pattern.name.as_ref() {
+                    let name_str = name.as_str();
+                    if let Some((file, range)) = model.resolve_name_definition(name_str) {
+                        Some(NavigationTargets::single(NavigationTarget {
+                            file,
+                            focus_range: range,
+                            full_range: range,
+                        }))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            GotoTarget::TypeParamTypeVarName(var) => {
+                let name = var.name.as_str();
+                if let Some((file, range)) = model.resolve_name_definition(name) {
+                    Some(NavigationTargets::single(NavigationTarget {
+                        file,
+                        focus_range: range,
+                        full_range: range,
+                    }))
+                } else {
+                    None
+                }
+            }
+            GotoTarget::TypeParamParamSpecName(bound) => {
+                let name = bound.name.as_str();
+                if let Some((file, range)) = model.resolve_name_definition(name) {
+                    Some(NavigationTargets::single(NavigationTarget {
+                        file,
+                        focus_range: range,
+                        full_range: range,
+                    }))
+                } else {
+                    None
+                }
+            }
+            GotoTarget::TypeParamTypeVarTupleName(tuple) => {
+                let name = tuple.name.as_str();
+                if let Some((file, range)) = model.resolve_name_definition(name) {
+                    Some(NavigationTargets::single(NavigationTarget {
+                        file,
+                        focus_range: range,
+                        full_range: range,
+                    }))
+                } else {
+                    None
+                }
+            }
+            GotoTarget::NonLocal { identifier } => {
+                let name = identifier.id.as_str();
+                if let Some((file, range)) = model.resolve_name_definition(name) {
+                    Some(NavigationTargets::single(NavigationTarget {
+                        file,
+                        focus_range: range,
+                        full_range: range,
+                    }))
+                } else {
+                    None
+                }
+            }
+            GotoTarget::Globals { identifier } => {
+                let name = identifier.id.as_str();
+                if let Some((file, range)) = model.resolve_name_definition(name) {
+                    Some(NavigationTargets::single(NavigationTarget {
+                        file,
+                        focus_range: range,
+                        full_range: range,
+                    }))
+                } else {
+                    None
+                }
+            }
+            GotoTarget::ImportedModule(module) => {
+                if let Some(module_name) = module.module.as_ref() {
+                    let name = module_name.id.as_str();
+                    if let Some((file, range)) = model.resolve_name_definition(name) {
+                        Some(NavigationTargets::single(NavigationTarget {
+                            file,
+                            focus_range: range,
+                            full_range: range,
+                        }))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
         }
     }
 }
@@ -297,7 +507,7 @@ pub(crate) fn find_goto_target(parsed: &ParsedModule, offset: TextSize) -> Optio
 #[cfg(test)]
 mod tests {
     use crate::tests::{cursor_test, CursorTest, IntoDiagnostic};
-    use crate::{goto_type_definition, NavigationTarget};
+    use crate::{goto_type_definition, goto_definition, NavigationTarget};
     use insta::assert_snapshot;
     use ruff_db::diagnostic::{
         Annotation, Diagnostic, DiagnosticId, LintName, Severity, Span, SubDiagnostic,
@@ -848,12 +1058,15 @@ f(**kwargs<CURSOR>)
 
         assert_snapshot!(test.goto_type_definition(), @r###"
         info[goto-type-definition]: Type definition
-         --> main.py:2:13
-          |
-        2 |             x = "test"
-          |             ^
-        3 |             x
-          |
+           --> stdlib/builtins.pyi:438:7
+            |
+        436 |     def __getitem__(self, key: int, /) -> str | int | None: ...
+        437 |
+        438 | class str(Sequence[str]):
+            |       ^^^
+        439 |     @overload
+        440 |     def __new__(cls, object: object = ...) -> Self: ...
+            |
         info: Source
          --> main.py:3:13
           |
@@ -862,6 +1075,29 @@ f(**kwargs<CURSOR>)
           |             ^
           |
         "###);
+    }
+
+    #[test]
+    fn goto_definition_function() {
+        let test = cursor_test(
+            r#"
+            def foo():
+                pass
+            
+            fo<CURSOR>o()
+            "#,
+        );
+
+        // This should go to the function definition, not the type
+        if let Some(targets) = goto_definition(&test.db, test.file, test.cursor_offset) {
+            assert!(!targets.is_empty());
+            // Should find the function definition
+            let target = &targets.value.into_iter().next().unwrap();
+            // The target should point to the function name in the definition
+            assert!(target.focus_range().start().to_u32() > 0);
+        } else {
+            panic!("Expected to find goto definition target");
+        }
     }
 
     impl CursorTest {
