@@ -53,7 +53,70 @@ impl<'db> SemanticModel<'db> {
         let range = binding.focus_range(self.db).range();
         Some((self.file, range))
     }
-    
+
+    /// Resolves an attribute access expression to its definition location.
+    /// This handles both local and cross-module attribute access.
+    /// For example: `a.b.c.ccc` -> resolves `ccc` in module `a.b.c`
+    pub fn resolve_attribute_definition(
+        &self, 
+        expr: ast::ExprRef<'_>
+    ) -> Option<(File, TextRange)> {
+        // Handle simple name expressions (local symbols)
+        if let Some(name_expr) = expr.as_name_expr() {
+            return self.resolve_name_definition(name_expr.id.as_str());
+        }
+
+        // Handle attribute access expressions
+        let attr_expr = expr.as_attribute_expr()?;
+        
+        // Try to resolve the attribute as a cross-module reference
+        if let Some((target_module, symbol_name)) = self.resolve_module_attribute(attr_expr) {
+            // Look up the symbol in the target module
+            let target_file = target_module.file()?;
+            let target_index = semantic_index(self.db, target_file);
+            let binding = target_index.binding_by_name(&symbol_name)?;
+            let range = binding.focus_range(self.db).range();
+            return Some((target_file, range));
+        }
+
+        // If not a cross-module reference, try to resolve as a local attribute
+        // (this would handle cases like self.attr, local_obj.method, etc.)
+        None
+    }
+
+    /// Resolves an attribute expression to a (module, symbol_name) pair if it represents
+    /// a cross-module reference like `a.b.c.symbol`
+    fn resolve_module_attribute(
+        &self,
+        attr_expr: &ast::ExprAttribute
+    ) -> Option<(Module, String)> {
+        let symbol_name = attr_expr.attr.id.to_string();
+        
+        // Try to resolve the value part as a module
+        let value_type = self.infer_expression_type(&attr_expr.value)?;
+        
+        // Check if the value resolves to a module
+        if let Some(module_literal) = value_type.into_module_literal() {
+            let module = module_literal.module(self.db);
+            return Some((module, symbol_name));
+        }
+        
+        None
+    }
+
+    /// Infer the type of an expression (simplified version for module resolution)
+    fn infer_expression_type(&self, expr: &ast::Expr) -> Option<Type<'_>> {
+        let expr_ref = ast::ExprRef::from(expr);
+        let index = semantic_index(self.db, self.file);
+        let file_scope = index.expression_scope_id(expr_ref);
+        let scope = file_scope.to_scope_id(self.db, self.file);
+        let expression_id = expr_ref.scoped_expression_id(self.db, scope);
+        
+        // Get the type from inference
+        let inferred_types = infer_scope_types(self.db, scope);
+        Some(inferred_types.expression_type(expression_id))
+    }
+
     /// Returns completions for symbols available in the scope containing the
     /// given expression.
     ///

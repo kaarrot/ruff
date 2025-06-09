@@ -1,0 +1,7 @@
+[tool.ty]
+[tool.ty.src]
+root = "."
+
+[tool.ty.environment]
+python-version = "3.11"
+extra-paths = ["."] 

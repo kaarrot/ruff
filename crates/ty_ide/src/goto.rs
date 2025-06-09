@@ -1,7 +1,8 @@
 use crate::find_node::covering_node;
 use crate::{Db, HasNavigationTargets, NavigationTarget, NavigationTargets, RangedValue};
-use ruff_db::files::{File, FileRange};
+use ruff_db::files::{File, FileRange, system_path_to_file};
 use ruff_db::parsed::{ParsedModule, parsed_module};
+use ruff_db::source::{source_text, line_index};
 use ruff_python_ast::{self as ast, AnyNodeRef};
 use ruff_python_parser::TokenKind;
 use ruff_text_size::{Ranged, TextRange, TextSize};
@@ -179,7 +180,16 @@ impl<'db> GotoTarget<'db> {
         let model = SemanticModel::new(db.upcast(), current_file);
         match self {
             GotoTarget::Expression(expr) => {
-                // For expressions, try to go to the name definition first
+                // For expressions, try to resolve the full attribute chain first
+                if let Some((file, range)) = model.resolve_attribute_definition(expr) {
+                    return Some(NavigationTargets::single(NavigationTarget {
+                        file,
+                        focus_range: range,
+                        full_range: range,
+                    }));
+                }
+                
+                // Fallback: for simple name expressions, try local resolution
                 if let Some(name_expr) = expr.as_name_expr() {
                     if let Some((file, range)) = model.resolve_name_definition(name_expr.id.as_str()) {
                         return Some(NavigationTargets::single(NavigationTarget {
@@ -189,7 +199,8 @@ impl<'db> GotoTarget<'db> {
                         }));
                     }
                 }
-                // If not a name expression or no definition found, this is not a valid goto definition target
+                
+                // If no definition found, this is not a valid goto definition target
                 None
             }
             GotoTarget::FunctionDef(function) => {
@@ -513,7 +524,8 @@ mod tests {
         Annotation, Diagnostic, DiagnosticId, LintName, Severity, Span, SubDiagnostic,
     };
     use ruff_db::files::FileRange;
-    use ruff_text_size::Ranged;
+    use ruff_text_size::{Ranged, TextSize};
+    use ruff_db::source::{source_text, line_index};
 
     #[test]
     fn goto_type_of_expression_with_class_type() {
@@ -1134,6 +1146,59 @@ f(**kwargs<CURSOR>)
         }
     }
 
+    #[test]
+    fn goto_definition_cross_module() {
+        let mut test = cursor_test(
+            r#"
+            import a.b.c
+
+            def test():
+                result = a.b.c.c<CURSOR>cc()  # Should resolve to a/b/c.py
+                return result
+            "#,
+        );
+
+        test.write_file("a/__init__.py", "").unwrap();
+        test.write_file("a/b/__init__.py", "").unwrap();
+        test.write_file(
+            "a/b/c.py",
+            r#"
+def ccc():
+    """Function in a.b.c module"""
+    return 'hello'
+
+class CccClass:
+    def method(self):
+        return 'method'
+"#,
+        ).unwrap();
+
+        // Test goto definition on 'ccc' in 'a.b.c.ccc()'
+        if let Some(targets) = goto_definition(&test.db, test.file, test.cursor_offset) {
+            assert!(!targets.is_empty(), "Should find at least one target");
+            
+            // Should find the definition in a/b/c.py
+            let target = targets.value.into_iter().next().unwrap();
+            let target_file_path = target.file().path(&test.db);
+            let path_str = target_file_path.as_str();
+            
+            // Normalize path separators for cross-platform compatibility
+            let normalized_path = path_str.replace('\\', "/");
+            assert!(
+                normalized_path.ends_with("a/b/c.py"),
+                "Should resolve to a/b/c.py, got: {}",
+                normalized_path
+            );
+            
+            // Verify the target points to the ccc function definition
+            let target_source = source_text(&test.db, target.file());
+            let target_text = &target_source[target.focus_range()];
+            assert_eq!(target_text, "ccc", "Should point to the ccc function name");
+        } else {
+            panic!("Expected to find goto definition target for a.b.c.ccc");
+        }
+    }
+
     impl CursorTest {
         fn goto_type_definition(&self) -> String {
             let Some(targets) = goto_type_definition(&self.db, self.file, self.cursor_offset)
@@ -1150,6 +1215,24 @@ f(**kwargs<CURSOR>)
                 targets
                     .into_iter()
                     .map(|target| GotoTypeDefinitionDiagnostic::new(source, &target)),
+            )
+        }
+        
+        fn goto_definition(&self) -> String {
+            let Some(targets) = goto_definition(&self.db, self.file, self.cursor_offset)
+            else {
+                return "No goto target found".to_string();
+            };
+
+            if targets.is_empty() {
+                return "No definitions found".to_string();
+            }
+
+            let source = targets.range;
+            self.render_diagnostics(
+                targets
+                    .into_iter()
+                    .map(|target| GotoDefinitionDiagnostic::new(source, &target)),
             )
         }
     }
@@ -1179,6 +1262,41 @@ f(**kwargs<CURSOR>)
                 DiagnosticId::Lint(LintName::of("goto-type-definition")),
                 Severity::Info,
                 "Type definition".to_string(),
+            );
+            main.annotate(Annotation::primary(
+                Span::from(self.target.file()).with_range(self.target.range()),
+            ));
+            main.sub(source);
+
+            main
+        }
+    }
+
+    struct GotoDefinitionDiagnostic {
+        source: FileRange,
+        target: FileRange,
+    }
+
+    impl GotoDefinitionDiagnostic {
+        fn new(source: FileRange, target: &NavigationTarget) -> Self {
+            Self {
+                source,
+                target: FileRange::new(target.file(), target.focus_range()),
+            }
+        }
+    }
+
+    impl IntoDiagnostic for GotoDefinitionDiagnostic {
+        fn into_diagnostic(self) -> Diagnostic {
+            let mut source = SubDiagnostic::new(Severity::Info, "Source");
+            source.annotate(Annotation::primary(
+                Span::from(self.source.file()).with_range(self.source.range()),
+            ));
+
+            let mut main = Diagnostic::new(
+                DiagnosticId::Lint(LintName::of("goto-definition")),
+                Severity::Info,
+                "Definition".to_string(),
             );
             main.annotate(Annotation::primary(
                 Span::from(self.target.file()).with_range(self.target.range()),
