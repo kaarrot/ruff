@@ -50,8 +50,52 @@ impl<'db> SemanticModel<'db> {
         let index = semantic_index(self.db, self.file);
         // Find the binding for the given name in the current file
         let binding = index.binding_by_name(name)?;
+        
+        // Check if this binding is an import - if so, follow the import chain
+        use crate::semantic_index::definition::DefinitionKind;
+        match binding.kind(self.db) {
+            DefinitionKind::ImportFrom(import_from) => {
+                return self.resolve_imported_symbol_definition(import_from);
+            }
+            _ => {
+                // For non-import bindings, return the local definition
+                let range = binding.focus_range(self.db).range();
+                Some((self.file, range))
+            }
+        }
+    }
+
+    /// Resolves an imported symbol to its actual definition in the source module.
+    fn resolve_imported_symbol_definition(
+        &self,
+        import_from: &crate::semantic_index::definition::ImportFromDefinitionKind
+    ) -> Option<(File, TextRange)> {
+        // Get the import statement and alias
+        let import_stmt = import_from.import();
+        let alias = import_from.alias();
+        
+        // Extract module name from the import statement
+        let module_name = if let Some(module) = &import_stmt.module {
+            // Handle relative imports by resolving the module name
+            if import_stmt.level > 0 {
+                // TODO: Handle relative imports properly
+                return None;
+            }
+            module.as_str()
+        } else {
+            return None;
+        };
+        
+                 // Parse the module name
+         let module_name = crate::module_name::ModuleName::new(module_name)?;
+        let module = self.resolve_module(&module_name)?;
+        
+        // Find the symbol in the target module
+        let target_file = module.file()?;
+        let target_index = semantic_index(self.db, target_file);
+        let binding = target_index.binding_by_name(&alias.name)?;
         let range = binding.focus_range(self.db).range();
-        Some((self.file, range))
+        Some((target_file, range))
     }
 
     /// Resolves an attribute access expression to its definition location.
