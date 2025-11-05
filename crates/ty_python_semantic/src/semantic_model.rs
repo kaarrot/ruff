@@ -155,7 +155,7 @@ impl<'db> SemanticModel<'db> {
     /// This handles both local and cross-module attribute access.
     /// For example: `a.b.c.ccc` -> resolves `ccc` in module `a.b.c`
     pub fn resolve_attribute_definition(
-        &self, 
+        &self,
         expr: ast::ExprRef<'_>
     ) -> Option<(File, TextRange)> {
         // Handle simple name expressions (local symbols)
@@ -165,7 +165,45 @@ impl<'db> SemanticModel<'db> {
 
         // Handle attribute access expressions
         let attr_expr = expr.as_attribute_expr()?;
-        
+
+        // Special handling for cls.attr and self.attr
+        if let ast::Expr::Name(name) = attr_expr.value.as_ref() {
+            if name.id == "cls" || name.id == "self" {
+                // Find the containing class scope and look up the attribute there
+                let attr_name = attr_expr.attr.id.as_str();
+                let index = semantic_index(self.db, self.file);
+                let file_scope = index.expression_scope_id(expr);
+
+                // Walk up to find the class scope
+                for (scope_id, scope) in index.ancestor_scopes(file_scope) {
+                    if scope.node().as_class().is_some() {
+                        // Found the class scope, look for the attribute
+                        let symbol_table = index.symbol_table(scope_id);
+                        if let Some(symbol_id) = symbol_table.symbol_id_by_name(attr_name) {
+                            let use_def = index.use_def_map(scope_id);
+                            // Get all definitions and find the first one
+                            let mut first_def: Option<(crate::semantic_index::definition::Definition, TextRange)> = None;
+                            for definition in use_def.all_definitions_for_symbol(self.db, symbol_id) {
+                                let range = definition.focus_range(self.db).range();
+                                if let Some((_, first_range)) = first_def {
+                                    if range.start() < first_range.start() {
+                                        first_def = Some((definition, range));
+                                    }
+                                } else {
+                                    first_def = Some((definition, range));
+                                }
+                            }
+                            if let Some((_, range)) = first_def {
+                                return Some((self.file, range));
+                            }
+                        }
+                        break; // Found the class, no need to continue
+                    }
+                }
+                return None;
+            }
+        }
+
         // Try to resolve the attribute as a cross-module reference
         if let Some((target_module, symbol_name)) = self.resolve_module_attribute(attr_expr) {
             // Look up the symbol in the target module
