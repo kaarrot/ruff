@@ -190,7 +190,7 @@ pub(crate) mod node_key {
     use crate::node_key::NodeKey;
 
     #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, salsa::Update)]
-    pub(crate) struct ExpressionNodeKey(NodeKey);
+    pub struct ExpressionNodeKey(NodeKey);
 
     impl From<ast::ExprRef<'_>> for ExpressionNodeKey {
         fn from(value: ast::ExprRef<'_>) -> Self {

@@ -1,9 +1,9 @@
 use crate::find_node::covering_node;
 use crate::{Db, HasNavigationTargets, NavigationTarget, NavigationTargets, RangedValue};
-use ruff_db::files::{File, FileRange, system_path_to_file};
+use ruff_db::files::{File, FileRange};
 use ruff_db::parsed::{ParsedModule, parsed_module};
-use ruff_db::source::{source_text, line_index};
 use ruff_python_ast::{self as ast, AnyNodeRef};
+use ruff_python_ast::Expr;
 use ruff_python_parser::TokenKind;
 use ruff_text_size::{Ranged, TextRange, TextSize};
 use ty_python_semantic::types::Type;
@@ -138,6 +138,17 @@ pub(crate) enum GotoTarget<'a> {
     /// ```
     TypeParamTypeVarTupleName(&'a ast::TypeParamTypeVarTuple),
 
+
+    /// Go to on class method access, like `cls.test`
+    ClassMethodAccess {
+        class_method: &'a ast::ExprAttribute,
+    },
+    
+    /// Go to on local variable reference
+    LocalVariable {
+        name: &'a ast::ExprName, 
+    },    
+
     NonLocal {
         identifier: &'a ast::Identifier,
     },
@@ -160,6 +171,10 @@ impl<'db> GotoTarget<'db> {
                 // than using the inferred value.
                 argument.value.inferred_type(model)
             }
+            // Handle class method access
+            GotoTarget::ClassMethodAccess { class_method } => class_method.inferred_type(model),
+            // Handle local variable
+            GotoTarget::LocalVariable { name } => name.inferred_type(model),
             // TODO: Support identifier targets
             GotoTarget::PatternMatchRest(_)
             | GotoTarget::PatternKeywordArgument(_)
@@ -179,6 +194,47 @@ impl<'db> GotoTarget<'db> {
     pub(crate) fn navigation_targets(self, db: &dyn Db, current_file: File) -> Option<NavigationTargets> {
         let model = SemanticModel::new(db.upcast(), current_file);
         match self {
+            GotoTarget::ClassMethodAccess { class_method } => {
+                // For class method access like `cls.attr`, we need to find the class definition
+                // and then look up the attribute in that class's body
+
+                // The attribute name we're looking for
+                let attr_name = class_method.attr.id.as_str();
+
+                // Try to resolve the attribute through the semantic model
+                if let Some((file, range)) = model.resolve_attribute_definition(class_method.into()) {
+                    return Some(NavigationTargets::single(NavigationTarget {
+                        file,
+                        focus_range: range,
+                        full_range: range,
+                    }));
+                }
+
+                // Fallback: try to resolve just the attribute name in the current scope
+                // This handles cases where resolve_attribute_definition doesn't work
+                if let Some((file, range)) = model.resolve_name_definition(attr_name) {
+                    return Some(NavigationTargets::single(NavigationTarget {
+                        file,
+                        focus_range: range,
+                        full_range: range,
+                    }));
+                }
+
+                None
+            },
+            GotoTarget::LocalVariable { name } => {
+                let model = SemanticModel::new(db.upcast(), current_file);
+                let expr_ref = ast::ExprRef::from(name);
+                if let Some((file, range)) = model.resolve_name_definition_in_scope(name.id.as_str(), expr_ref) {
+                    Some(NavigationTargets::single(NavigationTarget {
+                        file,
+                        focus_range: range,
+                        full_range: range,
+                    }))
+                } else {
+                    None
+                }
+            },
             GotoTarget::Expression(expr) => {
                 // For expressions, try to resolve the full attribute chain first
                 if let Some((file, range)) = model.resolve_attribute_definition(expr) {
@@ -188,10 +244,10 @@ impl<'db> GotoTarget<'db> {
                         full_range: range,
                     }));
                 }
-                
+
                 // Fallback: for simple name expressions, try local resolution
                 if let Some(name_expr) = expr.as_name_expr() {
-                    if let Some((file, range)) = model.resolve_name_definition(name_expr.id.as_str()) {
+                    if let Some((file, range)) = model.resolve_name_definition_in_scope(name_expr.id.as_str(), expr) {
                         return Some(NavigationTargets::single(NavigationTarget {
                             file,
                             focus_range: range,
@@ -199,7 +255,7 @@ impl<'db> GotoTarget<'db> {
                         }));
                     }
                 }
-                
+
                 // If no definition found, this is not a valid goto definition target
                 None
             }
@@ -435,6 +491,8 @@ impl Ranged for GotoTarget<'_> {
             GotoTarget::ExceptVariable(except) => except.name.as_ref().unwrap().range,
             GotoTarget::KeywordArgument(keyword) => keyword.arg.as_ref().unwrap().range,
             GotoTarget::PatternMatchRest(rest) => rest.rest.as_ref().unwrap().range,
+            GotoTarget::ClassMethodAccess { class_method } => class_method.range(),
+            GotoTarget::LocalVariable { name } => name.range(),
             GotoTarget::PatternKeywordArgument(keyword) => keyword.attr.range,
             GotoTarget::PatternMatchStarName(star) => star.name.as_ref().unwrap().range,
             GotoTarget::PatternMatchAsName(as_name) => as_name.name.as_ref().unwrap().range,
@@ -464,50 +522,55 @@ pub(crate) fn find_goto_target(parsed: &ParsedModule, offset: TextSize) -> Optio
         .find(|node| node.is_identifier() || node.is_expression())
         .ok()?;
 
+    eprintln!("find_goto_target: Covering node is of kind {:?}", covering_node.node().kind());
     tracing::trace!("Covering node is of kind {:?}", covering_node.node().kind());
 
     match covering_node.node() {
-        AnyNodeRef::Identifier(identifier) => match covering_node.parent() {
-            Some(AnyNodeRef::StmtFunctionDef(function)) => Some(GotoTarget::FunctionDef(function)),
-            Some(AnyNodeRef::StmtClassDef(class)) => Some(GotoTarget::ClassDef(class)),
-            Some(AnyNodeRef::Parameter(parameter)) => Some(GotoTarget::Parameter(parameter)),
-            Some(AnyNodeRef::Alias(alias)) => Some(GotoTarget::Alias(alias)),
-            Some(AnyNodeRef::StmtImportFrom(from)) => Some(GotoTarget::ImportedModule(from)),
-            Some(AnyNodeRef::ExceptHandlerExceptHandler(handler)) => {
-                Some(GotoTarget::ExceptVariable(handler))
-            }
-            Some(AnyNodeRef::Keyword(keyword)) => Some(GotoTarget::KeywordArgument(keyword)),
-            Some(AnyNodeRef::PatternMatchMapping(mapping)) => {
-                Some(GotoTarget::PatternMatchRest(mapping))
-            }
-            Some(AnyNodeRef::PatternKeyword(keyword)) => {
-                Some(GotoTarget::PatternKeywordArgument(keyword))
-            }
-            Some(AnyNodeRef::PatternMatchStar(star)) => {
-                Some(GotoTarget::PatternMatchStarName(star))
-            }
-            Some(AnyNodeRef::PatternMatchAs(as_pattern)) => {
-                Some(GotoTarget::PatternMatchAsName(as_pattern))
-            }
-            Some(AnyNodeRef::TypeParamTypeVar(var)) => Some(GotoTarget::TypeParamTypeVarName(var)),
-            Some(AnyNodeRef::TypeParamParamSpec(bound)) => {
-                Some(GotoTarget::TypeParamParamSpecName(bound))
-            }
-            Some(AnyNodeRef::TypeParamTypeVarTuple(var_tuple)) => {
-                Some(GotoTarget::TypeParamTypeVarTupleName(var_tuple))
-            }
-            Some(AnyNodeRef::ExprAttribute(attribute)) => {
-                Some(GotoTarget::Expression(attribute.into()))
-            }
-            Some(AnyNodeRef::StmtNonlocal(_)) => Some(GotoTarget::NonLocal { identifier }),
-            Some(AnyNodeRef::StmtGlobal(_)) => Some(GotoTarget::Globals { identifier }),
-            None => None,
-            Some(parent) => {
-                tracing::debug!(
-                    "Missing `GoToTarget` for identifier with parent {:?}",
-                    parent.kind()
-                );
-                None
+        AnyNodeRef::Identifier(identifier) => {
+            eprintln!("find_goto_target: Found identifier, parent is: {:?}", covering_node.parent().map(|p| p.kind()));
+            match covering_node.parent() {
+                Some(AnyNodeRef::ExprName(name)) => Some(GotoTarget::LocalVariable { name }),
+                Some(AnyNodeRef::StmtFunctionDef(function)) => Some(GotoTarget::FunctionDef(function)),
+                Some(AnyNodeRef::StmtClassDef(class)) => Some(GotoTarget::ClassDef(class)),
+                Some(AnyNodeRef::Parameter(parameter)) => Some(GotoTarget::Parameter(parameter)),
+                Some(AnyNodeRef::Alias(alias)) => Some(GotoTarget::Alias(alias)),
+                Some(AnyNodeRef::StmtImportFrom(from)) => Some(GotoTarget::ImportedModule(from)),
+                Some(AnyNodeRef::ExceptHandlerExceptHandler(handler)) => {
+                    Some(GotoTarget::ExceptVariable(handler))
+                }
+                Some(AnyNodeRef::Keyword(keyword)) => Some(GotoTarget::KeywordArgument(keyword)),
+                Some(AnyNodeRef::PatternMatchMapping(mapping)) => {
+                    Some(GotoTarget::PatternMatchRest(mapping))
+                }
+                Some(AnyNodeRef::PatternKeyword(keyword)) => {
+                    Some(GotoTarget::PatternKeywordArgument(keyword))
+                }
+                Some(AnyNodeRef::PatternMatchStar(star)) => {
+                    Some(GotoTarget::PatternMatchStarName(star))
+                }
+                Some(AnyNodeRef::PatternMatchAs(as_pattern)) => {
+                    Some(GotoTarget::PatternMatchAsName(as_pattern))
+                }
+                Some(AnyNodeRef::TypeParamTypeVar(var)) => Some(GotoTarget::TypeParamTypeVarName(var)),
+                Some(AnyNodeRef::TypeParamParamSpec(bound)) => {
+                    Some(GotoTarget::TypeParamParamSpecName(bound))
+                }
+                Some(AnyNodeRef::TypeParamTypeVarTuple(var_tuple)) => {
+                    Some(GotoTarget::TypeParamTypeVarTupleName(var_tuple))
+                }
+                Some(AnyNodeRef::ExprAttribute(attribute)) => {
+                    Some(GotoTarget::Expression(attribute.into()))
+                }
+                Some(AnyNodeRef::StmtNonlocal(_)) => Some(GotoTarget::NonLocal { identifier }),
+                Some(AnyNodeRef::StmtGlobal(_)) => Some(GotoTarget::Globals { identifier }),
+                None => None,
+                Some(parent) => {
+                    tracing::debug!(
+                        "Missing `GoToTarget` for identifier with parent {:?}",
+                        parent.kind()
+                    );
+                    None
+                }
             }
         },
 
@@ -524,8 +587,8 @@ mod tests {
         Annotation, Diagnostic, DiagnosticId, LintName, Severity, Span, SubDiagnostic,
     };
     use ruff_db::files::FileRange;
-    use ruff_text_size::{Ranged, TextSize};
-    use ruff_db::source::{source_text, line_index};
+    use ruff_text_size::Ranged;
+    use ruff_db::source::source_text;
 
     #[test]
     fn goto_type_of_expression_with_class_type() {
@@ -1218,7 +1281,7 @@ class CccClass:
             )
         }
         
-        fn goto_definition(&self) -> String {
+        pub(crate) fn goto_definition(&self) -> String {
             let Some(targets) = goto_definition(&self.db, self.file, self.cursor_offset)
             else {
                 return "No goto target found".to_string();

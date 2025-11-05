@@ -412,6 +412,27 @@ impl<'db> UseDefMap<'db> {
         self.bindings_iterator(self.public_symbols[symbol].bindings())
     }
 
+    /// Returns all definitions for a symbol, including those that are no longer live.
+    /// This is useful for "goto definition" functionality where we want to find the first
+    /// definition even if it's been shadowed by later assignments.
+    pub(crate) fn all_definitions_for_symbol(
+        &self,
+        db: &'db dyn crate::Db,
+        symbol: ScopedSymbolId,
+    ) -> impl Iterator<Item = Definition<'db>> + '_ {
+        self.all_definitions
+            .iter()
+            .filter_map(move |def_opt| {
+                def_opt.and_then(|def| {
+                    if def.symbol(db) == symbol {
+                        Some(def)
+                    } else {
+                        None
+                    }
+                })
+            })
+    }
+
     pub(crate) fn instance_attribute_bindings(
         &self,
         symbol: ScopedSymbolId,

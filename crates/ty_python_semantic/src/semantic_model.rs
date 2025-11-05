@@ -43,6 +43,7 @@ impl<'db> SemanticModel<'db> {
     }
 
     /// Resolves a variable/function/class name to its definition location in the current file.
+    /// Searches starting from the global scope.
     pub fn resolve_name_definition(
         &self,
         name: &str,
@@ -50,7 +51,7 @@ impl<'db> SemanticModel<'db> {
         let index = semantic_index(self.db, self.file);
         // Find the binding for the given name in the current file
         let binding = index.binding_by_name(name)?;
-        
+
         // Check if this binding is an import - if so, follow the import chain
         use crate::semantic_index::definition::DefinitionKind;
         match binding.kind(self.db) {
@@ -63,6 +64,58 @@ impl<'db> SemanticModel<'db> {
                 Some((self.file, range))
             }
         }
+    }
+
+    /// Resolves a variable/function/class name to its definition location,
+    /// searching from a specific expression's scope and walking up the scope chain.
+    /// Returns the first definition in source order.
+    pub fn resolve_name_definition_in_scope(
+        &self,
+        name: &str,
+        expr: ast::ExprRef<'_>,
+    ) -> Option<(File, TextRange)> {
+        let index = semantic_index(self.db, self.file);
+        let file_scope = index.expression_scope_id(expr);
+
+        // Walk up the scope chain looking for the symbol
+        for (scope_id, _scope) in index.ancestor_scopes(file_scope) {
+            let symbol_table = index.symbol_table(scope_id);
+            if let Some(symbol_id) = symbol_table.symbol_id_by_name(name) {
+                let use_def = index.use_def_map(scope_id);
+
+                // Collect all definitions (including shadowed ones) and find the first one in source order
+                let mut first_binding: Option<(crate::semantic_index::definition::Definition, TextRange)> = None;
+
+                for definition in use_def.all_definitions_for_symbol(self.db, symbol_id) {
+                    let range = definition.focus_range(self.db).range();
+
+                    // Keep the binding with the smallest start offset (earliest in source)
+                    if let Some((_, first_range)) = first_binding {
+                        if range.start() < first_range.start() {
+                            first_binding = Some((definition, range));
+                        }
+                    } else {
+                        first_binding = Some((definition, range));
+                    }
+                }
+
+                if let Some((binding, range)) = first_binding {
+                    // Check if this binding is an import - if so, follow the import chain
+                    use crate::semantic_index::definition::DefinitionKind;
+                    match binding.kind(self.db) {
+                        DefinitionKind::ImportFrom(import_from) => {
+                            return self.resolve_imported_symbol_definition(import_from);
+                        }
+                        _ => {
+                            // For non-import bindings, return the local definition
+                            return Some((self.file, range));
+                        }
+                    }
+                }
+            }
+        }
+
+        None
     }
 
     /// Resolves an imported symbol to its actual definition in the source module.

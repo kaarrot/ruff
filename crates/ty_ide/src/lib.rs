@@ -298,4 +298,6 @@ mod tests {
     pub(super) trait IntoDiagnostic {
         fn into_diagnostic(self) -> Diagnostic;
     }
+
+    mod goto_new_test;
 }

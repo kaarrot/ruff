@@ -47,7 +47,7 @@ type SymbolMap = hashbrown::HashMap<ScopedSymbolId, (), FxBuildHasher>;
 ///
 /// Prefer using [`symbol_table`] when working with symbols from a single scope.
 #[salsa::tracked(returns(ref), no_eq)]
-pub(crate) fn semantic_index(db: &dyn Db, file: File) -> SemanticIndex<'_> {
+pub fn semantic_index(db: &dyn Db, file: File) -> SemanticIndex<'_> {
     let _span = tracing::trace_span!("semantic_index", ?file).entered();
 
     let parsed = parsed_module(db.upcast(), file);
@@ -169,7 +169,7 @@ pub(crate) enum EagerSnapshotResult<'map, 'db> {
 
 /// The symbol tables and use-def maps for all scopes in a file.
 #[derive(Debug, Update)]
-pub(crate) struct SemanticIndex<'db> {
+pub struct SemanticIndex<'db> {
     /// List of all symbol tables in this file, indexed by scope.
     symbol_tables: IndexVec<FileScopeId, Arc<SymbolTable>>,
 
@@ -228,7 +228,7 @@ impl<'db> SemanticIndex<'db> {
     /// Use the Salsa cached [`symbol_table()`] query if you only need the
     /// symbol table for a single scope.
     #[track_caller]
-    pub(super) fn symbol_table(&self, scope_id: FileScopeId) -> Arc<SymbolTable> {
+    pub fn symbol_table(&self, scope_id: FileScopeId) -> Arc<SymbolTable> {
         self.symbol_tables[scope_id].clone()
     }
 
@@ -252,7 +252,7 @@ impl<'db> SemanticIndex<'db> {
 
     /// Returns the ID of the `expression`'s enclosing scope.
     #[track_caller]
-    pub(crate) fn expression_scope_id(
+    pub fn expression_scope_id(
         &self,
         expression: impl Into<ExpressionNodeKey>,
     ) -> FileScopeId {
