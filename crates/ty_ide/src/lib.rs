@@ -5,6 +5,7 @@ pub mod goto;
 mod hover;
 mod inlay_hints;
 mod markup;
+mod references;
 
 pub use completion::completion;
 pub use db::Db;
@@ -12,6 +13,7 @@ pub use goto::{goto_definition, goto_type_definition};
 pub use hover::hover;
 pub use inlay_hints::inlay_hints;
 pub use markup::MarkupKind;
+pub use references::{find_references, find_references_with_files};
 
 use ruff_db::files::{File, FileRange};
 use ruff_text_size::{Ranged, TextRange};
@@ -75,6 +77,14 @@ pub struct NavigationTarget {
 }
 
 impl NavigationTarget {
+    pub fn new(file: File, focus_range: TextRange, full_range: TextRange) -> Self {
+        Self {
+            file,
+            focus_range,
+            full_range,
+        }
+    }
+
     pub fn file(&self) -> File {
         self.file
     }

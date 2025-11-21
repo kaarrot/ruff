@@ -160,6 +160,7 @@ impl Server {
     ) -> ServerCapabilities {
         ServerCapabilities {
             definition_provider: Some(lsp_types::OneOf::Left(true)),
+            references_provider: Some(lsp_types::OneOf::Left(true)),
             position_encoding: Some(position_encoding.into()),
             diagnostic_provider: Some(DiagnosticServerCapabilities::Options(DiagnosticOptions {
                 identifier: Some(crate::DIAGNOSTIC_NAME.into()),

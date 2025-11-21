@@ -5,6 +5,7 @@ mod hover;
 mod inlay_hints;
 mod shutdown;
 mod goto_definition;
+mod references;
 
 pub(super) use goto_definition::GotoDefinitionRequestHandler;
 pub(super) use completion::CompletionRequestHandler;
@@ -13,3 +14,4 @@ pub(super) use goto_type_definition::GotoTypeDefinitionRequestHandler;
 pub(super) use hover::HoverRequestHandler;
 pub(super) use inlay_hints::InlayHintRequestHandler;
 pub(super) use shutdown::ShutdownHandler;
+pub(super) use references::ReferencesRequestHandler;
