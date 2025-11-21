@@ -146,18 +146,61 @@ fn find_name_references(
 
     impl SourceOrderVisitor<'_> for ReferenceVisitor<'_> {
         fn visit_expr(&mut self, expr: &ast::Expr) {
-            if let ast::Expr::Name(name_expr) = expr {
-                if name_expr.id.as_str() == self.symbol_name {
-                    self.references.push(NavigationTarget::new(
-                        self.file,
-                        name_expr.range,
-                        name_expr.range,
-                    ));
+            match expr {
+                ast::Expr::Name(name_expr) => {
+                    // Handle simple name references like: x, foo, MyClass
+                    if name_expr.id.as_str() == self.symbol_name {
+                        self.references.push(NavigationTarget::new(
+                            self.file,
+                            name_expr.range,
+                            name_expr.range,
+                        ));
+                    }
                 }
+                ast::Expr::Attribute(attr_expr) => {
+                    // Handle attribute access like: a.m1, obj.method
+                    if attr_expr.attr.as_str() == self.symbol_name {
+                        self.references.push(NavigationTarget::new(
+                            self.file,
+                            attr_expr.attr.range(),
+                            attr_expr.attr.range(),
+                        ));
+                    }
+                }
+                _ => {}
             }
 
             // Continue visiting children
             ruff_python_ast::visitor::source_order::walk_expr(self, expr);
+        }
+
+        fn visit_stmt(&mut self, stmt: &ast::Stmt) {
+            match stmt {
+                ast::Stmt::FunctionDef(func_def) => {
+                    // Handle function/method definition names like: def m1(cls):
+                    if func_def.name.as_str() == self.symbol_name {
+                        self.references.push(NavigationTarget::new(
+                            self.file,
+                            func_def.name.range(),
+                            func_def.name.range(),
+                        ));
+                    }
+                }
+                ast::Stmt::ClassDef(class_def) => {
+                    // Handle class definition names like: class MyClass:
+                    if class_def.name.as_str() == self.symbol_name {
+                        self.references.push(NavigationTarget::new(
+                            self.file,
+                            class_def.name.range(),
+                            class_def.name.range(),
+                        ));
+                    }
+                }
+                _ => {}
+            }
+
+            // Continue visiting children
+            ruff_python_ast::visitor::source_order::walk_stmt(self, stmt);
         }
     }
 
@@ -215,8 +258,8 @@ mod tests {
         assert!(references.is_some());
         let refs = references.unwrap();
 
-        // Should find 2 references (call, assignment) - definition names are handled differently in AST
-        assert_eq!(refs.len(), 2);
+        // Should find 3 references: function definition, call, and assignment
+        assert_eq!(refs.len(), 3);
     }
 
     #[test]
@@ -254,8 +297,8 @@ mod tests {
         assert!(references.is_some());
         let refs = references.unwrap();
 
-        // Should find 2 references (two instantiations)
-        assert_eq!(refs.len(), 2);
+        // Should find 3 references: class definition and two instantiations
+        assert_eq!(refs.len(), 3);
     }
 
     #[test]
@@ -364,13 +407,17 @@ mod tests {
 
             obj = MyClass()
             obj.method<CURSOR>()
+            obj2 = MyClass()
+            obj2.method()
             "#,
         );
 
         let references = find_references(&test.db, test.file, test.cursor_offset, true);
-        // This may or may not find references depending on how we handle attributes
-        // For now, just check it doesn't crash
-        assert!(references.is_some() || references.is_none());
+        assert!(references.is_some());
+        let refs = references.unwrap();
+
+        // Should find 3 references: method definition and two method calls
+        assert_eq!(refs.len(), 3);
     }
 
     #[test]
