@@ -42,6 +42,26 @@ impl<'db> SemanticModel<'db> {
         resolve_module(self.db, module_name)
     }
 
+    /// Resolves a module from an import statement to its file location.
+    /// Handles both absolute and relative imports.
+    pub fn resolve_import_module_definition(
+        &self,
+        import_from: &ast::StmtImportFrom,
+    ) -> Option<(File, TextRange)> {
+        // Resolve the module name (handles both absolute and relative imports)
+        let module_name = crate::module_name::ModuleName::from_import_statement(
+            self.db,
+            self.file,
+            import_from
+        ).ok()?;
+
+        let module = self.resolve_module(&module_name)?;
+        let file = module.file()?;
+
+        // Return the first line of the file (or a better location if we can find it)
+        Some((file, TextRange::default()))
+    }
+
     /// Resolves a variable/function/class name to its definition location in the current file.
     /// Searches starting from the global scope.
     pub fn resolve_name_definition(
@@ -126,23 +146,16 @@ impl<'db> SemanticModel<'db> {
         // Get the import statement and alias
         let import_stmt = import_from.import();
         let alias = import_from.alias();
-        
-        // Extract module name from the import statement
-        let module_name = if let Some(module) = &import_stmt.module {
-            // Handle relative imports by resolving the module name
-            if import_stmt.level > 0 {
-                // TODO: Handle relative imports properly
-                return None;
-            }
-            module.as_str()
-        } else {
-            return None;
-        };
-        
-                 // Parse the module name
-         let module_name = crate::module_name::ModuleName::new(module_name)?;
+
+        // Resolve the module name (handles both absolute and relative imports)
+        let module_name = crate::module_name::ModuleName::from_import_statement(
+            self.db,
+            self.file,
+            import_stmt
+        ).ok()?;
+
         let module = self.resolve_module(&module_name)?;
-        
+
         // Find the symbol in the target module
         let target_file = module.file()?;
         let target_index = semantic_index(self.db, target_file);
