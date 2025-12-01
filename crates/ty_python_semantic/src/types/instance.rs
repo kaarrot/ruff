@@ -74,6 +74,11 @@ impl<'db> NominalInstanceType<'db> {
         }
     }
 
+    /// Returns the class that this is an instance of.
+    pub(crate) fn class(self) -> ClassType<'db> {
+        self.class
+    }
+
     pub(super) fn normalized(self, db: &'db dyn Db) -> Self {
         Self::from_class(self.class.normalized(db))
     }

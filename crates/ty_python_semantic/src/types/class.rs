@@ -982,6 +982,34 @@ impl<'db> ClassLiteral<'db> {
             .contains(&ClassBase::Class(other))
     }
 
+    /// Find which class in the MRO defines the given member.
+    /// Returns the ClassType and File of the defining class, if found.
+    pub(crate) fn find_member_defining_class(
+        self,
+        db: &'db dyn Db,
+        specialization: Option<Specialization<'db>>,
+        name: &str,
+    ) -> Option<(ClassType<'db>, File)> {
+        use crate::semantic_index::semantic_index;
+
+        for base in self.iter_mro(db, specialization) {
+            if let ClassBase::Class(base_class) = base {
+                // Get the class literal and its scope
+                let (base_literal, _) = base_class.class_literal(db);
+                let base_scope = base_literal.body_scope(db);
+                let base_file = base_scope.file(db);
+
+                // Check if this class defines the member
+                let index = semantic_index(db, base_file);
+                let symbol_table = index.symbol_table(base_scope.file_scope_id(db));
+                if symbol_table.symbol_id_by_name(name).is_some() {
+                    return Some((base_class, base_file));
+                }
+            }
+        }
+        None
+    }
+
     /// Return the explicit `metaclass` of this class, if one is defined.
     ///
     /// ## Note

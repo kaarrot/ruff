@@ -1338,4 +1338,132 @@ class CccClass:
             main
         }
     }
+
+    #[test]
+    fn goto_definition_inherited_method() {
+        let test = cursor_test(
+            r#"
+            class A:
+                def m1(cls):
+                    pass
+
+                def m2(self):
+                    pass
+
+                def m3(self):
+                    pass
+
+            class B(A):
+                def __init__(self):
+                    super().__init__()
+
+            b = B()
+            b.m<CURSOR>1()  # should go to class method of the base class
+            "#,
+        );
+
+        assert_snapshot!(test.goto_definition(), @r"
+        info[goto-definition]: Definition
+         --> main.py:3:21
+          |
+        2 |             class A:
+        3 |                 def m1(cls):
+          |                     ^^
+        4 |                     pass
+          |
+        info: Source
+          --> main.py:17:15
+           |
+        16 |             b = B()
+        17 |             b.m1()  # should go to class method of the base class
+           |               ^^
+           |
+        ");
+    }
+
+    #[test]
+    fn goto_definition_inherited_method_m2() {
+        let test = cursor_test(
+            r#"
+            class A:
+                def m1(cls):
+                    pass
+
+                def m2(self):
+                    pass
+
+                def m3(self):
+                    pass
+
+            class B(A):
+                def __init__(self):
+                    super().__init__()
+
+            b = B()
+            b.m<CURSOR>2()  # should go to method of base class
+            "#,
+        );
+
+        assert_snapshot!(test.goto_definition(), @r"
+        info[goto-definition]: Definition
+         --> main.py:6:21
+          |
+        4 |                     pass
+        5 |
+        6 |                 def m2(self):
+          |                     ^^
+        7 |                     pass
+          |
+        info: Source
+          --> main.py:17:15
+           |
+        16 |             b = B()
+        17 |             b.m2()  # should go to method of base class
+           |               ^^
+           |
+        ");
+    }
+
+    #[test]
+    fn goto_definition_inherited_method_m3() {
+        let test = cursor_test(
+            r#"
+            class A:
+                def m1(cls):
+                    pass
+
+                def m2(self):
+                    pass
+
+                def m3(self):
+                    pass
+
+            class B(A):
+                def __init__(self):
+                    super().__init__()
+
+            b = B()
+            b.m<CURSOR>3()  # should go to method of the base class
+            "#,
+        );
+
+        assert_snapshot!(test.goto_definition(), @r"
+        info[goto-definition]: Definition
+          --> main.py:9:21
+           |
+         7 |                     pass
+         8 |
+         9 |                 def m3(self):
+           |                     ^^
+        10 |                     pass
+           |
+        info: Source
+          --> main.py:17:15
+           |
+        16 |             b = B()
+        17 |             b.m3()  # should go to method of the base class
+           |               ^^
+           |
+        ");
+    }
 }

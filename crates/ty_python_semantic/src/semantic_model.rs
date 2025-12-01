@@ -175,26 +175,39 @@ impl<'db> SemanticModel<'db> {
                 let file_scope = index.expression_scope_id(expr);
 
                 // Walk up to find the class scope
-                for (scope_id, scope) in index.ancestor_scopes(file_scope) {
-                    if scope.node().as_class().is_some() {
-                        // Found the class scope, look for the attribute
-                        let symbol_table = index.symbol_table(scope_id);
-                        if let Some(symbol_id) = symbol_table.symbol_id_by_name(attr_name) {
-                            let use_def = index.use_def_map(scope_id);
-                            // Get all definitions and find the first one
-                            let mut first_def: Option<(crate::semantic_index::definition::Definition, TextRange)> = None;
-                            for definition in use_def.all_definitions_for_symbol(self.db, symbol_id) {
-                                let range = definition.focus_range(self.db).range();
-                                if let Some((_, first_range)) = first_def {
-                                    if range.start() < first_range.start() {
-                                        first_def = Some((definition, range));
+                for (_scope_id, scope) in index.ancestor_scopes(file_scope) {
+                    if let Some(class_def_node) = scope.node().as_class() {
+                        // Get the type of the class
+                        let class_type = class_def_node.inferred_type(&SemanticModel::new(self.db, self.file));
+
+                        // Try to extract ClassLiteral from the type
+                        if let Some(class_literal) = class_type.into_class_literal() {
+                            // Use the new helper to find which class defines this member
+                            if let Some((defining_class, defining_file)) = class_literal.find_member_defining_class(self.db, None, attr_name) {
+                                // Get the definition range
+                                let (def_literal, _) = defining_class.class_literal(self.db);
+                                let def_scope = def_literal.body_scope(self.db);
+                                let def_index = semantic_index(self.db, defining_file);
+                                let symbol_table = def_index.symbol_table(def_scope.file_scope_id(self.db));
+
+                                if let Some(symbol_id) = symbol_table.symbol_id_by_name(attr_name) {
+                                    let use_def = def_index.use_def_map(def_scope.file_scope_id(self.db));
+                                    // Get all definitions and find the first one
+                                    let mut first_def: Option<TextRange> = None;
+                                    for definition in use_def.all_definitions_for_symbol(self.db, symbol_id) {
+                                        let range = definition.focus_range(self.db).range();
+                                        if let Some(first_range) = first_def {
+                                            if range.start() < first_range.start() {
+                                                first_def = Some(range);
+                                            }
+                                        } else {
+                                            first_def = Some(range);
+                                        }
                                     }
-                                } else {
-                                    first_def = Some((definition, range));
+                                    if let Some(range) = first_def {
+                                        return Some((defining_file, range));
+                                    }
                                 }
-                            }
-                            if let Some((_, range)) = first_def {
-                                return Some((self.file, range));
                             }
                         }
                         break; // Found the class, no need to continue
@@ -214,9 +227,9 @@ impl<'db> SemanticModel<'db> {
             return Some((target_file, range));
         }
 
-        // If not a cross-module reference, try to resolve as a local attribute
-        // (this would handle cases like self.attr, local_obj.method, etc.)
-        None
+        // If not a cross-module reference, try to resolve as an instance attribute
+        // (this would handle cases like obj.method, a.m1(), etc.)
+        self.resolve_instance_attribute_definition(attr_expr)
     }
 
     /// Resolves an attribute expression to a (module, symbol_name) pair if it represents
@@ -246,10 +259,60 @@ impl<'db> SemanticModel<'db> {
         let file_scope = index.expression_scope_id(expr_ref);
         let scope = file_scope.to_scope_id(self.db, self.file);
         let expression_id = expr_ref.scoped_expression_id(self.db, scope);
-        
+
         // Get the type from inference
         let inferred_types = infer_scope_types(self.db, scope);
         Some(inferred_types.expression_type(expression_id))
+    }
+
+    /// Resolves an instance attribute (e.g., `obj.method`) to its definition location.
+    fn resolve_instance_attribute_definition(
+        &self,
+        attr_expr: &ast::ExprAttribute
+    ) -> Option<(File, TextRange)> {
+        let attr_name = attr_expr.attr.id.as_str();
+
+        // Get the type of the value (the object we're accessing the attribute on)
+        let value_type = self.infer_expression_type(&attr_expr.value)?;
+
+        // Try to get the class from the type
+        // For instances, we need to check if it's an instance type
+        let class_literal = if let Some(instance) = value_type.into_nominal_instance() {
+            // Get the class from the instance type
+            // ClassType::class_literal returns (ClassLiteral, Option<Specialization>)
+            let (literal, _) = instance.class().class_literal(self.db);
+            Some(literal)
+        } else {
+            // For class objects themselves (e.g., calling class methods), get the class directly
+            value_type.into_class_literal()
+        }?;
+
+        // Find which class in the MRO defines this member
+        let (defining_class, defining_file) = class_literal.find_member_defining_class(self.db, None, attr_name)?;
+
+        // Get the definition range
+        let (def_literal, _) = defining_class.class_literal(self.db);
+        let def_scope = def_literal.body_scope(self.db);
+        let def_index = semantic_index(self.db, defining_file);
+        let symbol_table = def_index.symbol_table(def_scope.file_scope_id(self.db));
+
+        let symbol_id = symbol_table.symbol_id_by_name(attr_name)?;
+        let use_def = def_index.use_def_map(def_scope.file_scope_id(self.db));
+
+        // Get all definitions and find the first one (earliest in source order)
+        let mut first_def: Option<TextRange> = None;
+        for definition in use_def.all_definitions_for_symbol(self.db, symbol_id) {
+            let range = definition.focus_range(self.db).range();
+            if let Some(first_range) = first_def {
+                if range.start() < first_range.start() {
+                    first_def = Some(range);
+                }
+            } else {
+                first_def = Some(range);
+            }
+        }
+
+        first_def.map(|range| (defining_file, range))
     }
 
     /// Returns completions for symbols available in the scope containing the
