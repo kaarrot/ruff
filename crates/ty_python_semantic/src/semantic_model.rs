@@ -296,23 +296,52 @@ impl<'db> SemanticModel<'db> {
         let def_index = semantic_index(self.db, defining_file);
         let symbol_table = def_index.symbol_table(def_scope.file_scope_id(self.db));
 
-        let symbol_id = symbol_table.symbol_id_by_name(attr_name)?;
-        let use_def = def_index.use_def_map(def_scope.file_scope_id(self.db));
+        // First, try to find it in the class body
+        if let Some(symbol_id) = symbol_table.symbol_id_by_name(attr_name) {
+            let use_def = def_index.use_def_map(def_scope.file_scope_id(self.db));
 
-        // Get all definitions and find the first one (earliest in source order)
-        let mut first_def: Option<TextRange> = None;
-        for definition in use_def.all_definitions_for_symbol(self.db, symbol_id) {
-            let range = definition.focus_range(self.db).range();
-            if let Some(first_range) = first_def {
-                if range.start() < first_range.start() {
+            // Get all definitions and find the first one (earliest in source order)
+            let mut first_def: Option<TextRange> = None;
+            for definition in use_def.all_definitions_for_symbol(self.db, symbol_id) {
+                let range = definition.focus_range(self.db).range();
+                if let Some(first_range) = first_def {
+                    if range.start() < first_range.start() {
+                        first_def = Some(range);
+                    }
+                } else {
                     first_def = Some(range);
                 }
-            } else {
-                first_def = Some(range);
+            }
+
+            if let Some(range) = first_def {
+                return Some((defining_file, range));
             }
         }
 
-        first_def.map(|range| (defining_file, range))
+        // If not found in class body, look for instance attribute assignments (e.g., self.x = 2)
+        use crate::semantic_index::attribute_assignments;
+        for (bindings, _method_scope_id) in attribute_assignments(self.db, def_scope, attr_name) {
+            // Get the first binding (earliest in source order)
+            let mut first_def: Option<TextRange> = None;
+            for binding_with_constraints in bindings {
+                if let Some(binding) = binding_with_constraints.binding {
+                    let range = binding.focus_range(self.db).range();
+                    if let Some(first_range) = first_def {
+                        if range.start() < first_range.start() {
+                            first_def = Some(range);
+                        }
+                    } else {
+                        first_def = Some(range);
+                    }
+                }
+            }
+
+            if let Some(range) = first_def {
+                return Some((defining_file, range));
+            }
+        }
+
+        None
     }
 
     /// Returns completions for symbols available in the scope containing the

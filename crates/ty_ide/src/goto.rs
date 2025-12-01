@@ -1466,4 +1466,46 @@ class CccClass:
            |
         ");
     }
+
+    #[test]
+    fn goto_definition_inherited_instance_attribute() {
+        let test = cursor_test(
+            r#"
+            class A:
+                def __init__(self):
+                    self.x = 1
+
+                def m2(self):
+                    self.x = 2
+
+            class B(A):
+                def __init__(self):
+                    super().__init__()
+
+            b = B()
+            b.<CURSOR>x  # should go to instance attribute in base class
+            "#,
+        );
+
+        assert_snapshot!(test.goto_definition(), @r"
+        info[goto-definition]: Definition
+         --> main.py:4:21
+          |
+        2 |             class A:
+        3 |                 def __init__(self):
+        4 |                     self.x = 1
+          |                     ^^^^^^
+        5 |
+        6 |                 def m2(self):
+          |
+        info: Source
+          --> main.py:14:15
+           |
+        13 |             b = B()
+        14 |             b.x  # should go to instance attribute in base class
+           |               ^
+           |
+        ");
+    }
 }
+

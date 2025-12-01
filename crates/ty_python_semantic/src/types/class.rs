@@ -984,13 +984,15 @@ impl<'db> ClassLiteral<'db> {
 
     /// Find which class in the MRO defines the given member.
     /// Returns the ClassType and File of the defining class, if found.
+    /// This looks for both class-level members (in the class body) and instance attributes
+    /// (set in methods like __init__).
     pub(crate) fn find_member_defining_class(
         self,
         db: &'db dyn Db,
         specialization: Option<Specialization<'db>>,
         name: &str,
     ) -> Option<(ClassType<'db>, File)> {
-        use crate::semantic_index::semantic_index;
+        use crate::semantic_index::{semantic_index, attribute_assignments};
 
         for base in self.iter_mro(db, specialization) {
             if let ClassBase::Class(base_class) = base {
@@ -999,10 +1001,17 @@ impl<'db> ClassLiteral<'db> {
                 let base_scope = base_literal.body_scope(db);
                 let base_file = base_scope.file(db);
 
-                // Check if this class defines the member
+                // Check if this class defines the member in its class body
                 let index = semantic_index(db, base_file);
                 let symbol_table = index.symbol_table(base_scope.file_scope_id(db));
                 if symbol_table.symbol_id_by_name(name).is_some() {
+                    return Some((base_class, base_file));
+                }
+
+                // Also check if this class defines the member as an instance attribute
+                // (e.g., self.x = 1 in a method)
+                for (_bindings, _method_scope_id) in attribute_assignments(db, base_scope, name) {
+                    // If we found any assignments to this attribute, this class defines it
                     return Some((base_class, base_file));
                 }
             }
