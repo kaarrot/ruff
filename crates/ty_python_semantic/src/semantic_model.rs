@@ -62,6 +62,60 @@ impl<'db> SemanticModel<'db> {
         Some((file, TextRange::default()))
     }
 
+    /// Resolves a simple import statement to its module file location.
+    /// For example: `import aaa.bbb.ccc` resolves to the file for module `aaa.bbb.ccc`
+    ///
+    /// The `cursor_offset` parameter is used to determine which part of a dotted
+    /// import path the cursor is on (e.g., in "import aaa.bbb.ccc", if cursor is on
+    /// "bbb", it should resolve to aaa.bbb, not aaa.bbb.ccc)
+    pub fn resolve_simple_import_definition(
+        &self,
+        alias: &ast::Alias,
+        cursor_offset: ruff_text_size::TextSize,
+    ) -> Option<(File, TextRange)> {
+        // For simple imports like "import aaa.bbb.ccc", we need to figure out
+        // which part of the dotted path the cursor is on
+        let full_name = &alias.name.id;
+        let alias_start = alias.name.range.start();
+
+        // Calculate the relative position within the identifier
+        let relative_offset = cursor_offset - alias_start;
+
+        // Find which component the cursor is on by counting characters
+        let mut current_offset = 0u32;
+        let components: Vec<&str> = full_name.split('.').collect();
+        let mut target_components = Vec::new();
+
+        for (i, component) in components.iter().enumerate() {
+            let component_start = current_offset;
+            let component_end = current_offset + component.len() as u32;
+
+            // Check if cursor is within this component
+            if relative_offset.to_u32() >= component_start && relative_offset.to_u32() < component_end {
+                // Build the module name up to and including this component
+                target_components = components[..=i].to_vec();
+                break;
+            }
+
+            // Move past this component and the dot
+            current_offset = component_end + 1; // +1 for the dot
+        }
+
+        // If we didn't find a component, use all of them (shouldn't happen)
+        if target_components.is_empty() {
+            target_components = components;
+        }
+
+        let module_name_str = target_components.join(".");
+        let module_name = ModuleName::new(&module_name_str)?;
+
+        let module = self.resolve_module(&module_name)?;
+        let file = module.file()?;
+
+        // Return the first line of the file (or a better location if we can find it)
+        Some((file, TextRange::default()))
+    }
+
     /// Resolves a variable/function/class name to its definition location in the current file.
     /// Searches starting from the global scope.
     pub fn resolve_name_definition(

@@ -76,6 +76,11 @@ impl<'a> CoveringNode<'a> {
         self.ancestors.last().copied()
     }
 
+    /// Returns an iterator over the node's ancestors, from closest to root.
+    pub(crate) fn ancestors(&self) -> impl Iterator<Item = AnyNodeRef<'a>> + '_ {
+        self.ancestors.iter().rev().copied()
+    }
+
     /// Finds the minimal node that fully covers the range and fulfills the given predicate.
     pub(crate) fn find(mut self, f: impl Fn(AnyNodeRef<'a>) -> bool) -> Result<Self, Self> {
         if f(self.node) {

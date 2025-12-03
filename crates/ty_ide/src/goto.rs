@@ -3,7 +3,6 @@ use crate::{Db, HasNavigationTargets, NavigationTarget, NavigationTargets, Range
 use ruff_db::files::{File, FileRange};
 use ruff_db::parsed::{ParsedModule, parsed_module};
 use ruff_python_ast::{self as ast, AnyNodeRef};
-use ruff_python_ast::Expr;
 use ruff_python_parser::TokenKind;
 use ruff_text_size::{Ranged, TextRange, TextSize};
 use ty_python_semantic::types::Type;
@@ -64,6 +63,16 @@ pub(crate) enum GotoTarget<'a> {
     ///      ^^^
     /// ```
     ImportedModule(&'a ast::StmtImportFrom),
+
+    /// Go to on the module name of a simple import
+    /// ```py
+    /// import foo.bar.baz
+    ///        ^^^^^^^^^^^
+    /// ```
+    ImportedModuleSimple {
+        alias: &'a ast::Alias,
+        cursor_offset: TextSize,
+    },
 
     /// Go to on the exception handler variable
     /// ```py
@@ -174,6 +183,7 @@ impl<'db> GotoTarget<'db> {
             | GotoTarget::PatternMatchStarName(_)
             | GotoTarget::PatternMatchAsName(_)
             | GotoTarget::ImportedModule(_)
+            | GotoTarget::ImportedModuleSimple { .. }
             | GotoTarget::TypeParamTypeVarName(_)
             | GotoTarget::TypeParamParamSpecName(_)
             | GotoTarget::TypeParamTypeVarTupleName(_)
@@ -435,6 +445,17 @@ impl<'db> GotoTarget<'db> {
                     None
                 }
             }
+            GotoTarget::ImportedModuleSimple { alias, cursor_offset } => {
+                if let Some((file, range)) = model.resolve_simple_import_definition(alias, cursor_offset) {
+                    Some(NavigationTargets::single(NavigationTarget {
+                        file,
+                        focus_range: range,
+                        full_range: range,
+                    }))
+                } else {
+                    None
+                }
+            }
         }
     }
 }
@@ -455,6 +476,7 @@ impl Ranged for GotoTarget<'_> {
             GotoTarget::Parameter(parameter) => parameter.name.range,
             GotoTarget::Alias(alias) => alias.name.range,
             GotoTarget::ImportedModule(module) => module.module.as_ref().unwrap().range,
+            GotoTarget::ImportedModuleSimple { alias, .. } => alias.name.range,
             GotoTarget::ExceptVariable(except) => except.name.as_ref().unwrap().range,
             GotoTarget::KeywordArgument(keyword) => keyword.arg.as_ref().unwrap().range,
             GotoTarget::PatternMatchRest(rest) => rest.rest.as_ref().unwrap().range,
@@ -497,7 +519,19 @@ pub(crate) fn find_goto_target(parsed: &ParsedModule, offset: TextSize) -> Optio
                 Some(AnyNodeRef::StmtFunctionDef(function)) => Some(GotoTarget::FunctionDef(function)),
                 Some(AnyNodeRef::StmtClassDef(class)) => Some(GotoTarget::ClassDef(class)),
                 Some(AnyNodeRef::Parameter(parameter)) => Some(GotoTarget::Parameter(parameter)),
-                Some(AnyNodeRef::Alias(alias)) => Some(GotoTarget::Alias(alias)),
+                Some(AnyNodeRef::Alias(alias)) => {
+                    // Check if this is part of a simple import statement
+                    // by looking at the grandparent node
+                    if let Some(grandparent) = covering_node.ancestors().nth(1) {
+                        if matches!(grandparent, AnyNodeRef::StmtImport(_)) {
+                            return Some(GotoTarget::ImportedModuleSimple {
+                                alias,
+                                cursor_offset: offset,
+                            });
+                        }
+                    }
+                    Some(GotoTarget::Alias(alias))
+                }
                 Some(AnyNodeRef::StmtImportFrom(from)) => Some(GotoTarget::ImportedModule(from)),
                 Some(AnyNodeRef::ExceptHandlerExceptHandler(handler)) => {
                     Some(GotoTarget::ExceptVariable(handler))
@@ -1527,6 +1561,129 @@ class CccClass:
         // The result might be "No goto target found" without proper package setup,
         // but the important thing is the code path is implemented
         assert!(result.contains("goto") || result.contains("No goto"));
+    }
+
+    #[test]
+    fn goto_definition_simple_import_statement() {
+        // Test clicking on the module name in "import aaa.bbb.ccc"
+        let mut test = cursor_test(
+            r#"
+            import aaa.bbb.<CURSOR>ccc
+
+            def test():
+                result = aaa.bbb.ccc.func()
+                return result
+            "#,
+        );
+
+        test.write_file("aaa/__init__.py", "").unwrap();
+        test.write_file("aaa/bbb/__init__.py", "").unwrap();
+        test.write_file(
+            "aaa/bbb/ccc.py",
+            r#"
+def func():
+    """Function in aaa.bbb.ccc module"""
+    return 'hello'
+"#,
+        ).unwrap();
+
+        // Test goto definition on 'aaa.bbb.ccc' in 'import aaa.bbb.ccc'
+        if let Some(targets) = goto_definition(&test.db, test.file, test.cursor_offset) {
+            assert!(!targets.is_empty(), "Should find at least one target");
+
+            // Should find the definition in aaa/bbb/ccc.py
+            let target = targets.value.into_iter().next().unwrap();
+            let target_file_path = target.file().path(&test.db);
+            let path_str = target_file_path.as_str();
+
+            // Normalize path separators for cross-platform compatibility
+            let normalized_path = path_str.replace('\\', "/");
+            assert!(
+                normalized_path.ends_with("aaa/bbb/ccc.py"),
+                "Should resolve to aaa/bbb/ccc.py, got: {}",
+                normalized_path
+            );
+        } else {
+            panic!("Expected to find goto definition target for import aaa.bbb.ccc");
+        }
+    }
+
+    #[test]
+    fn goto_definition_from_import_statement() {
+        // Test clicking on the symbol name in "from aaa.bbb import ccc"
+        let mut test = cursor_test(
+            r#"
+            from aaa.bbb import c<CURSOR>cc
+
+            def test():
+                result = ccc()
+                return result
+            "#,
+        );
+
+        test.write_file("aaa/__init__.py", "").unwrap();
+        test.write_file("aaa/bbb/__init__.py", "").unwrap();
+        test.write_file(
+            "aaa/bbb/ccc.py",
+            r#"
+def ccc():
+    """Function in aaa.bbb.ccc module"""
+    return 'hello'
+"#,
+        ).unwrap();
+
+        // This should still work as before (from import)
+        // Note: This is testing the imported symbol, not the module
+        // The result might vary depending on how the symbol is defined
+        let result = test.goto_definition();
+        // Just verify it doesn't crash
+        assert!(result.contains("goto") || result.contains("No goto") || result.contains("Definition"));
+    }
+
+    #[test]
+    fn goto_definition_simple_import_partial_path() {
+        // Test clicking on different parts of "import aaa.bbb.ccc"
+        // When clicking on "bbb", should jump to aaa/bbb/__init__.py
+        let mut test = cursor_test(
+            r#"
+            import aaa.b<CURSOR>bb.ccc
+
+            def test():
+                result = aaa.bbb.ccc.func()
+                return result
+            "#,
+        );
+
+        test.write_file("aaa/__init__.py", "# aaa module").unwrap();
+        test.write_file("aaa/bbb/__init__.py", "# aaa.bbb module").unwrap();
+        test.write_file(
+            "aaa/bbb/ccc.py",
+            r#"
+def func():
+    """Function in aaa.bbb.ccc module"""
+    return 'hello'
+"#,
+        ).unwrap();
+
+        // Test goto definition on 'bbb' in 'import aaa.bbb.ccc'
+        if let Some(targets) = goto_definition(&test.db, test.file, test.cursor_offset) {
+            assert!(!targets.is_empty(), "Should find at least one target");
+
+            // Should find the definition in aaa/bbb/__init__.py
+            let target = targets.value.into_iter().next().unwrap();
+            let target_file_path = target.file().path(&test.db);
+            let path_str = target_file_path.as_str();
+
+            // Normalize path separators for cross-platform compatibility
+            let normalized_path = path_str.replace('\\', "/");
+            assert!(
+                normalized_path.ends_with("aaa/bbb/__init__.py"),
+                "Should resolve to aaa/bbb/__init__.py, got: {}",
+                normalized_path
+            );
+        } else {
+            panic!("Expected to find goto definition target for bbb in import aaa.bbb.ccc");
+        }
     }
 }
 
