@@ -210,7 +210,21 @@ impl<'db> SemanticModel<'db> {
 
         let module = self.resolve_module(&module_name)?;
 
-        // Find the symbol in the target module
+        // First, check if the imported name is actually a submodule
+        // For example: `from aaa.bbb import ccc` where ccc is aaa/bbb/ccc.py
+        let parent_module_name = module.name();
+        let potential_submodule_name = format!("{}.{}", parent_module_name, alias.name);
+
+        if let Some(submodule_name) = ModuleName::new(&potential_submodule_name) {
+            if let Some(submodule) = self.resolve_module(&submodule_name) {
+                if let Some(submodule_file) = submodule.file() {
+                    // It's a submodule! Return the file location
+                    return Some((submodule_file, TextRange::default()));
+                }
+            }
+        }
+
+        // Not a submodule, so find the symbol in the target module
         let target_file = module.file()?;
         let target_index = semantic_index(self.db, target_file);
         let binding = target_index.binding_by_name(&alias.name)?;
@@ -286,7 +300,22 @@ impl<'db> SemanticModel<'db> {
 
         // Try to resolve the attribute as a cross-module reference
         if let Some((target_module, symbol_name)) = self.resolve_module_attribute(attr_expr) {
-            // Look up the symbol in the target module
+            // First, check if the symbol is a submodule
+            // For example: in `aaa.bbb.ccc`, if we're resolving `ccc` as an attribute of `aaa.bbb`,
+            // we should check if `aaa.bbb.ccc` is a submodule
+            let parent_module_name = target_module.name();
+            let potential_submodule_name = format!("{}.{}", parent_module_name, symbol_name);
+
+            if let Some(submodule_name) = ModuleName::new(&potential_submodule_name) {
+                if let Some(submodule) = self.resolve_module(&submodule_name) {
+                    if let Some(submodule_file) = submodule.file() {
+                        // It's a submodule! Return the file location
+                        return Some((submodule_file, TextRange::default()));
+                    }
+                }
+            }
+
+            // Not a submodule, so look up the symbol in the target module
             let target_file = target_module.file()?;
             let target_index = semantic_index(self.db, target_file);
             let binding = target_index.binding_by_name(&symbol_name)?;

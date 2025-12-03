@@ -1611,6 +1611,7 @@ def func():
     #[test]
     fn goto_definition_from_import_statement() {
         // Test clicking on the symbol name in "from aaa.bbb import ccc"
+        // This should jump to the ccc function defined in aaa/bbb/__init__.py
         let mut test = cursor_test(
             r#"
             from aaa.bbb import c<CURSOR>cc
@@ -1622,22 +1623,82 @@ def func():
         );
 
         test.write_file("aaa/__init__.py", "").unwrap();
-        test.write_file("aaa/bbb/__init__.py", "").unwrap();
         test.write_file(
-            "aaa/bbb/ccc.py",
+            "aaa/bbb/__init__.py",
             r#"
 def ccc():
-    """Function in aaa.bbb.ccc module"""
-    return 'hello'
+    """Function ccc in aaa.bbb module"""
+    return 'hello from bbb'
 "#,
         ).unwrap();
 
-        // This should still work as before (from import)
-        // Note: This is testing the imported symbol, not the module
-        // The result might vary depending on how the symbol is defined
-        let result = test.goto_definition();
-        // Just verify it doesn't crash
-        assert!(result.contains("goto") || result.contains("No goto") || result.contains("Definition"));
+        // Test goto definition on 'ccc' in 'from aaa.bbb import ccc'
+        let result = goto_definition(&test.db, test.file, test.cursor_offset);
+
+        if result.is_none() {
+            eprintln!("ERROR: goto_definition returned None");
+            panic!("Expected to find goto definition target for ccc in from aaa.bbb import ccc");
+        }
+
+        let targets = result.unwrap();
+
+        if targets.value.is_empty() {
+            eprintln!("ERROR: targets is empty");
+            panic!("Should find at least one target");
+        }
+
+        // Should find the function definition in aaa/bbb/__init__.py
+        let target = targets.value.into_iter().next().unwrap();
+        let target_file_path = target.file().path(&test.db);
+        let path_str = target_file_path.as_str();
+
+        eprintln!("Target file: {}", path_str);
+
+        // Normalize path separators for cross-platform compatibility
+        let normalized_path = path_str.replace('\\', "/");
+        assert!(
+            normalized_path.ends_with("aaa/bbb/__init__.py"),
+            "Should resolve to aaa/bbb/__init__.py where ccc is defined, got: {}",
+            normalized_path
+        );
+    }
+
+    #[test]
+    fn goto_definition_from_import_module_path() {
+        // Test clicking on the module path in "from aaa.bbb import ccc"
+        // When clicking on "bbb", should jump to aaa/bbb/__init__.py
+        let mut test = cursor_test(
+            r#"
+            from aaa.b<CURSOR>bb import ccc
+
+            def test():
+                result = ccc()
+                return result
+            "#,
+        );
+
+        test.write_file("aaa/__init__.py", "# aaa module").unwrap();
+        test.write_file("aaa/bbb/__init__.py", "# aaa.bbb module\ndef ccc(): pass").unwrap();
+
+        // Test goto definition on 'bbb' in 'from aaa.bbb import ccc'
+        if let Some(targets) = goto_definition(&test.db, test.file, test.cursor_offset) {
+            assert!(!targets.is_empty(), "Should find at least one target");
+
+            // Should find the definition in aaa/bbb/__init__.py
+            let target = targets.value.into_iter().next().unwrap();
+            let target_file_path = target.file().path(&test.db);
+            let path_str = target_file_path.as_str();
+
+            // Normalize path separators for cross-platform compatibility
+            let normalized_path = path_str.replace('\\', "/");
+            assert!(
+                normalized_path.ends_with("aaa/bbb/__init__.py"),
+                "Should resolve to aaa/bbb/__init__.py, got: {}",
+                normalized_path
+            );
+        } else {
+            panic!("Expected to find goto definition target for bbb in from aaa.bbb import ccc");
+        }
     }
 
     #[test]
@@ -1684,6 +1745,119 @@ def func():
         } else {
             panic!("Expected to find goto definition target for bbb in import aaa.bbb.ccc");
         }
+    }
+
+    #[test]
+    fn goto_definition_from_import_submodule() {
+        // Test clicking on a submodule name in "from aaa.bbb import ccc"
+        // When ccc is a module file (not a symbol), should jump to aaa/bbb/ccc.py
+        let mut test = cursor_test(
+            r#"
+            from aaa.bbb import c<CURSOR>cc
+
+            def test():
+                result = ccc.func()
+                return result
+            "#,
+        );
+
+        test.write_file("aaa/__init__.py", "").unwrap();
+        test.write_file("aaa/bbb/__init__.py", "").unwrap();
+        test.write_file(
+            "aaa/bbb/ccc.py",
+            r#"
+def func():
+    """Function in ccc module"""
+    return 'hello'
+"#,
+        ).unwrap();
+
+        // Test goto definition on 'ccc' in 'from aaa.bbb import ccc'
+        let result = goto_definition(&test.db, test.file, test.cursor_offset);
+
+        if result.is_none() {
+            eprintln!("ERROR: goto_definition returned None for ccc in from aaa.bbb import ccc");
+            panic!("Expected to find goto definition target");
+        }
+
+        let targets = result.unwrap();
+
+        if targets.value.is_empty() {
+            eprintln!("ERROR: targets is empty");
+            panic!("Should find at least one target");
+        }
+
+        // Should find the module file aaa/bbb/ccc.py
+        let target = targets.value.into_iter().next().unwrap();
+        let target_file_path = target.file().path(&test.db);
+        let path_str = target_file_path.as_str();
+
+        eprintln!("Target file: {}", path_str);
+
+        // Normalize path separators for cross-platform compatibility
+        let normalized_path = path_str.replace('\\', "/");
+        assert!(
+            normalized_path.ends_with("aaa/bbb/ccc.py"),
+            "Should resolve to aaa/bbb/ccc.py, got: {}",
+            normalized_path
+        );
+    }
+
+    #[test]
+    fn goto_definition_submodule_in_expression() {
+        // Test clicking on a submodule in an expression like aaa.bbb.ccc.func()
+        // When clicking on "ccc", should jump to aaa/bbb/ccc.py
+        let mut test = cursor_test(
+            r#"
+            import aaa.bbb.ccc
+
+            def test():
+                result = aaa.bbb.c<CURSOR>cc.func()
+                return result
+            "#,
+        );
+
+        test.write_file("aaa/__init__.py", "# aaa module").unwrap();
+        test.write_file("aaa/bbb/__init__.py", "# aaa.bbb module").unwrap();
+        test.write_file(
+            "aaa/bbb/ccc.py",
+            r#"
+def func():
+    """Function in aaa.bbb.ccc module"""
+    return 'hello'
+"#,
+        ).unwrap();
+
+        // Test goto definition on 'ccc' in 'aaa.bbb.ccc.func()'
+        let result = goto_definition(&test.db, test.file, test.cursor_offset);
+
+        if result.is_none() {
+            eprintln!("ERROR: goto_definition returned None for ccc in aaa.bbb.ccc.func()");
+            eprintln!("This means the goto target was not found");
+            panic!("Expected to find goto definition target for ccc in aaa.bbb.ccc.func()");
+        }
+
+        let targets = result.unwrap();
+
+        if targets.value.is_empty() {
+            eprintln!("ERROR: targets is empty");
+            panic!("Should find at least one target");
+        }
+
+        // Should find the definition in aaa/bbb/ccc.py
+        let target = targets.value.into_iter().next().unwrap();
+        let target_file_path = target.file().path(&test.db);
+        let path_str = target_file_path.as_str();
+
+        eprintln!("SUCCESS: Found target file: {}", path_str);
+
+        // Normalize path separators for cross-platform compatibility
+        let normalized_path = path_str.replace('\\', "/");
+        assert!(
+            normalized_path.ends_with("aaa/bbb/ccc.py"),
+            "Should resolve to aaa/bbb/ccc.py, got: {}",
+            normalized_path
+        );
     }
 }
 
