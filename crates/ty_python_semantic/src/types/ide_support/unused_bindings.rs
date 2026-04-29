@@ -1,4 +1,5 @@
 use crate::Db;
+use crate::dunder_all::dunder_all_names;
 use crate::reachability::is_reachable;
 use crate::types::function::FunctionDecorators;
 use crate::types::infer::function_known_decorator_flags;
@@ -7,7 +8,7 @@ use ruff_db::parsed::parsed_module;
 use ruff_python_ast::name::Name;
 use ruff_text_size::TextRange;
 use rustc_hash::FxHashSet;
-use ty_python_core::definition::{DefinitionCategory, DefinitionKind, DefinitionState};
+use ty_python_core::definition::{Definition, DefinitionCategory, DefinitionKind, DefinitionState};
 use ty_python_core::place::ScopedPlaceId;
 use ty_python_core::scope::{FileScopeId, ScopeKind};
 use ty_python_core::{SemanticIndex, get_loop_header, semantic_index};
@@ -22,17 +23,18 @@ fn should_consider_definition(kind: &DefinitionKind<'_>) -> bool {
         | DefinitionKind::For(_)
         | DefinitionKind::Comprehension(_)
         | DefinitionKind::Parameter(_)
-        | DefinitionKind::LambdaParameter { .. }
+        | DefinitionKind::LambdaParameter(_)
         | DefinitionKind::WithItem(_)
         | DefinitionKind::MatchPattern(_)
         | DefinitionKind::ExceptHandler(_) => true,
 
-        DefinitionKind::Import(_)
-        | DefinitionKind::ImportFrom(_)
-        | DefinitionKind::ImportFromSubmodule(_)
+        DefinitionKind::Import(_) | DefinitionKind::ImportFrom(_) | DefinitionKind::Class(_) => {
+            true
+        }
+
+        DefinitionKind::ImportFromSubmodule(_)
         | DefinitionKind::StarImport(_)
         | DefinitionKind::Function(_)
-        | DefinitionKind::Class(_)
         | DefinitionKind::TypeAlias(_)
         | DefinitionKind::AugmentedAssignment(_)
         | DefinitionKind::DictKeyAssignment(_)
@@ -41,6 +43,103 @@ fn should_consider_definition(kind: &DefinitionKind<'_>) -> bool {
         | DefinitionKind::TypeVarTuple(_)
         | DefinitionKind::LoopHeader(_) => false,
     }
+}
+
+fn unused_binding_kind(
+    db: &dyn Db,
+    definition: Definition<'_>,
+    scope_kind: ScopeKind,
+    all_names: Option<&FxHashSet<Name>>,
+    name: &Name,
+) -> Option<UnusedBindingKind> {
+    match definition.kind(db) {
+        DefinitionKind::NamedExpression(_)
+        | DefinitionKind::Assignment(_)
+        | DefinitionKind::AnnotatedAssignment(_)
+        | DefinitionKind::For(_)
+        | DefinitionKind::Comprehension(_)
+        | DefinitionKind::Parameter(_)
+        | DefinitionKind::LambdaParameter(_)
+        | DefinitionKind::WithItem(_)
+        | DefinitionKind::MatchPattern(_)
+        | DefinitionKind::ExceptHandler(_) => matches!(
+            scope_kind,
+            ScopeKind::Function | ScopeKind::Lambda | ScopeKind::Comprehension
+        )
+        .then_some(UnusedBindingKind::Local),
+
+        DefinitionKind::Import(_) | DefinitionKind::ImportFrom(_) => {
+            if definition.is_reexported(db)
+                || all_names.is_some_and(|all_names| all_names.contains(name))
+            {
+                return None;
+            }
+            Some(UnusedBindingKind::Import)
+        }
+
+        DefinitionKind::Class(_) => match scope_kind {
+            ScopeKind::Function | ScopeKind::Lambda | ScopeKind::Comprehension => {
+                Some(UnusedBindingKind::Class)
+            }
+            ScopeKind::Module => {
+                let all_names = all_names?;
+                (!all_names.contains(name)).then_some(UnusedBindingKind::Class)
+            }
+            ScopeKind::Class | ScopeKind::TypeParams | ScopeKind::TypeAlias => None,
+        },
+
+        DefinitionKind::ImportFromSubmodule(_)
+        | DefinitionKind::StarImport(_)
+        | DefinitionKind::Function(_)
+        | DefinitionKind::TypeAlias(_)
+        | DefinitionKind::AugmentedAssignment(_)
+        | DefinitionKind::DictKeyAssignment(_)
+        | DefinitionKind::TypeVar(_)
+        | DefinitionKind::ParamSpec(_)
+        | DefinitionKind::TypeVarTuple(_)
+        | DefinitionKind::LoopHeader(_) => None,
+    }
+}
+
+fn module_symbol_is_used_in_descendant_scope(
+    db: &dyn Db,
+    index: &SemanticIndex<'_>,
+    file_scope_id: FileScopeId,
+    name: &str,
+) -> bool {
+    debug_assert!(index.scope(file_scope_id).kind().is_module());
+
+    index.scope_ids().any(|scope_id| {
+        let descendant_scope_id = scope_id.file_scope_id(db);
+        if descendant_scope_id == file_scope_id {
+            return false;
+        }
+
+        let place_table = index.place_table(descendant_scope_id);
+        let Some(nested_symbol_id) = place_table.symbol_id(name) else {
+            return false;
+        };
+
+        let nested_symbol = place_table.symbol(nested_symbol_id);
+        if !nested_symbol.is_used() || nested_symbol.is_local() || nested_symbol.is_nonlocal() {
+            return false;
+        }
+
+        if nested_symbol.is_global() {
+            return true;
+        }
+
+        index
+            .visible_ancestor_scopes(descendant_scope_id)
+            .skip(1)
+            .find_map(|(ancestor_scope_id, _)| {
+                let ancestor_place_table = index.place_table(ancestor_scope_id);
+                let ancestor_symbol_id = ancestor_place_table.symbol_id(name)?;
+                let ancestor_symbol = ancestor_place_table.symbol(ancestor_symbol_id);
+                ancestor_symbol.is_local().then_some(ancestor_scope_id)
+            })
+            == Some(file_scope_id)
+    })
 }
 
 fn function_scope_is_overload_declaration(
@@ -61,33 +160,42 @@ fn function_scope_is_overload_declaration(
 pub struct UnusedBinding {
     pub range: TextRange,
     pub name: Name,
+    pub kind: UnusedBindingKind,
 }
 
-/// Collects unused local bindings for IDE-facing diagnostics.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Ord, PartialOrd, GetSize)]
+pub enum UnusedBindingKind {
+    Local,
+    Import,
+    Class,
+}
+
+/// Collects unused bindings for IDE-facing diagnostics.
 ///
-/// This intentionally reports only function-, lambda-, and comprehension-scope bindings.
-/// Module- and class-scope bindings can still be observed indirectly (for example via
-/// imports or attribute access), so reporting them here would risk false positives
-/// without broader reference analysis. Bare local annotations (`x: int`) are also
-/// reported, but only if the symbol is neither bound nor used elsewhere in the scope.
+/// This intentionally reports local variables only in function-, lambda-, and
+/// comprehension-scopes. Module- and class-scope bindings can still be observed
+/// indirectly (for example via imports or attribute access), so reporting them here
+/// would risk false positives without broader reference analysis. Bare local
+/// annotations (`x: int`) are also reported, but only if the symbol is neither bound
+/// nor used elsewhere in the scope.
+///
+/// Imports and class definitions are reported conservatively using only per-file
+/// semantic use-def information. Imports that are explicit re-exports, star imports,
+/// synthetic submodule imports, or names exported through a valid `__all__` are
+/// skipped. Module-level classes are only reported when a valid `__all__` excludes
+/// them; class-body classes are skipped because they can be accessed as attributes.
 #[salsa::tracked(returns(deref), heap_size=ruff_memory_usage::heap_size)]
 pub fn unused_bindings(db: &dyn Db, file: ruff_db::files::File) -> Vec<UnusedBinding> {
     let parsed = parsed_module(db, file).load(db);
     let is_stub_file = file.is_stub(db);
     let index = semantic_index(db, file);
+    let all_names = dunder_all_names(db, file);
     let mut unused = Vec::new();
 
     for scope_id in index.scope_ids() {
         let file_scope_id = scope_id.file_scope_id(db);
         let scope = index.scope(file_scope_id);
         let scope_kind = scope.kind();
-
-        if !matches!(
-            scope_kind,
-            ScopeKind::Function | ScopeKind::Lambda | ScopeKind::Comprehension
-        ) {
-            continue;
-        }
 
         let is_method_scope = index.class_definition_of_method(file_scope_id).is_some();
         let method_has_stub_body = is_method_scope
@@ -126,12 +234,11 @@ pub fn unused_bindings(db: &dyn Db, file: ruff_db::files::File) -> Vec<UnusedBin
                 continue;
             }
 
-            let kind = definition.kind(db);
-            if !should_consider_definition(kind) {
+            if !should_consider_definition(definition.kind(db)) {
                 continue;
             }
 
-            let is_parameter = kind.is_parameter_def();
+            let is_parameter = definition.kind(db).is_parameter_def();
 
             if is_parameter
                 && (is_stub_file || function_is_overload_declaration || method_has_stub_body)
@@ -161,18 +268,47 @@ pub fn unused_bindings(db: &dyn Db, file: ruff_db::files::File) -> Vec<UnusedBin
                 continue;
             }
 
-            let category = kind.category(is_stub_file, &parsed);
+            if scope_kind.is_module()
+                && matches!(
+                    definition.kind(db),
+                    DefinitionKind::Import(_)
+                        | DefinitionKind::ImportFrom(_)
+                        | DefinitionKind::Class(_)
+                )
+                && use_def_map
+                    .end_of_scope_symbol_bindings(symbol_id)
+                    .any(|live_binding| {
+                        matches!(
+                            live_binding.binding,
+                            DefinitionState::Defined(live_definition) if live_definition == definition
+                        )
+                            && is_reachable(db, use_def_map, live_binding.reachability_constraint)
+                    })
+                && module_symbol_is_used_in_descendant_scope(db, index, file_scope_id, name)
+            {
+                continue;
+            }
+
+            let Some(kind) =
+                unused_binding_kind(db, definition, scope_kind, all_names, symbol.name())
+            else {
+                continue;
+            };
+
+            let definition_kind = definition.kind(db);
+            let category = definition_kind.category(is_stub_file, &parsed);
             if matches!(category, DefinitionCategory::Declaration)
                 && (symbol.is_bound() || symbol.is_used())
             {
                 continue;
             }
 
-            let range = kind.target_range(&parsed);
+            let range = definition_kind.target_range(&parsed);
 
             unused.push(UnusedBinding {
                 range,
                 name: symbol.name().clone(),
+                kind,
             });
         }
     }
@@ -185,7 +321,7 @@ pub fn unused_bindings(db: &dyn Db, file: ruff_db::files::File) -> Vec<UnusedBin
 
 #[cfg(test)]
 mod tests {
-    use super::{UnusedBinding, unused_bindings};
+    use super::{UnusedBinding, UnusedBindingKind, unused_bindings};
     use crate::db::tests::TestDbBuilder;
     use ruff_db::files::system_path_to_file;
     use ruff_python_ast::name::Name;
@@ -196,7 +332,20 @@ mod tests {
         path: &str,
         source: &str,
     ) -> anyhow::Result<Vec<UnusedBinding>> {
-        let db = TestDbBuilder::new().with_file(path, source).build()?;
+        collect_unused_bindings_in_file_with_extra(path, source, &[])
+    }
+
+    fn collect_unused_bindings_in_file_with_extra(
+        path: &str,
+        source: &str,
+        extra_files: &[(&str, &str)],
+    ) -> anyhow::Result<Vec<UnusedBinding>> {
+        let mut builder = TestDbBuilder::new().with_file(path, source);
+        for (extra_path, extra_source) in extra_files {
+            builder = builder.with_file(extra_path, extra_source);
+        }
+
+        let db = builder.build()?;
         let file = system_path_to_file(&db, path).unwrap();
         let mut bindings = unused_bindings(&db, file).to_vec();
         bindings.sort_unstable_by_key(|binding| (binding.range.start(), binding.range.end()));
@@ -208,7 +357,15 @@ mod tests {
     }
 
     fn collect_unused_names_in_file(path: &str, source: &str) -> anyhow::Result<Vec<String>> {
-        let mut names = collect_unused_bindings_in_file(path, source)?
+        collect_unused_names_in_file_with_extra(path, source, &[])
+    }
+
+    fn collect_unused_names_in_file_with_extra(
+        path: &str,
+        source: &str,
+        extra_files: &[(&str, &str)],
+    ) -> anyhow::Result<Vec<String>> {
+        let mut names = collect_unused_bindings_in_file_with_extra(path, source, extra_files)?
             .iter()
             .map(|binding| binding.name.to_string())
             .collect::<Vec<_>>();
@@ -218,6 +375,28 @@ mod tests {
 
     fn collect_unused_names(source: &str) -> anyhow::Result<Vec<String>> {
         collect_unused_names_in_file("/src/main.py", source)
+    }
+
+    fn collect_unused_name_kinds(source: &str) -> anyhow::Result<Vec<String>> {
+        let mut name_kinds = collect_unused_bindings(source)?
+            .iter()
+            .map(|binding| format!("{}:{:?}", binding.name, binding.kind))
+            .collect::<Vec<_>>();
+        name_kinds.sort();
+        Ok(name_kinds)
+    }
+
+    fn collect_unused_name_kinds_in_file_with_extra(
+        path: &str,
+        source: &str,
+        extra_files: &[(&str, &str)],
+    ) -> anyhow::Result<Vec<String>> {
+        let mut name_kinds = collect_unused_bindings_in_file_with_extra(path, source, extra_files)?
+            .iter()
+            .map(|binding| format!("{}:{:?}", binding.name, binding.kind))
+            .collect::<Vec<_>>();
+        name_kinds.sort();
+        Ok(name_kinds)
     }
 
     #[test]
@@ -289,6 +468,207 @@ mod tests {
 
         let names = collect_unused_names(&source)?;
         assert_eq!(names, vec!["local_dead"]);
+        Ok(())
+    }
+
+    #[test]
+    fn reports_unused_imports() -> anyhow::Result<()> {
+        let source = dedent(
+            "
+            import os
+            from sys import path
+
+            def f():
+                import math
+                from collections import deque
+                return 0
+            ",
+        );
+
+        let name_kinds = collect_unused_name_kinds(&source)?;
+        assert_eq!(
+            name_kinds,
+            vec!["deque:Import", "math:Import", "os:Import", "path:Import",]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn skips_used_imports() -> anyhow::Result<()> {
+        let source = dedent(
+            "
+            import os
+            from sys import path
+
+            def f():
+                import math
+                return os.name, path, math.pi
+            ",
+        );
+
+        let names = collect_unused_names(&source)?;
+        assert_eq!(names, Vec::<String>::new());
+        Ok(())
+    }
+
+    #[test]
+    fn skips_reexported_imports() -> anyhow::Result<()> {
+        let source = dedent(
+            "
+            import os as os
+            from sys import path as path
+            from collections import deque
+            ",
+        );
+
+        let name_kinds = collect_unused_name_kinds(&source)?;
+        assert_eq!(name_kinds, vec!["deque:Import"]);
+        Ok(())
+    }
+
+    #[test]
+    fn skips_star_imports() -> anyhow::Result<()> {
+        let source = "from exporter import *";
+        let exporter = dedent(
+            "
+            __all__ = [\"value\"]
+            value = 1
+            ",
+        );
+
+        let names = collect_unused_names_in_file_with_extra(
+            "/src/main.py",
+            source,
+            &[("/src/exporter.py", &exporter)],
+        )?;
+        assert_eq!(names, Vec::<String>::new());
+        Ok(())
+    }
+
+    #[test]
+    fn skips_synthetic_submodule_imports() -> anyhow::Result<()> {
+        let source = "from .sub import value";
+        let submodule = "value = 1";
+
+        let name_kinds = collect_unused_name_kinds_in_file_with_extra(
+            "/src/pkg/__init__.py",
+            source,
+            &[("/src/pkg/sub.py", submodule)],
+        )?;
+        assert_eq!(name_kinds, vec!["value:Import"]);
+        Ok(())
+    }
+
+    #[test]
+    fn skips_imports_exported_through_dunder_all() -> anyhow::Result<()> {
+        let source = dedent(
+            "
+            from os import environ
+            from sys import path
+
+            __all__ = [\"path\"]
+            ",
+        );
+
+        let name_kinds = collect_unused_name_kinds(&source)?;
+        assert_eq!(name_kinds, vec!["environ:Import"]);
+        Ok(())
+    }
+
+    #[test]
+    fn reports_unused_local_classes() -> anyhow::Result<()> {
+        let source = dedent(
+            "
+            def f():
+                class Local:
+                    pass
+
+                class Used:
+                    pass
+
+                return Used
+            ",
+        );
+
+        let name_kinds = collect_unused_name_kinds(&source)?;
+        assert_eq!(name_kinds, vec!["Local:Class"]);
+        Ok(())
+    }
+
+    #[test]
+    fn skips_class_body_classes() -> anyhow::Result<()> {
+        let source = dedent(
+            "
+            class Outer:
+                class Inner:
+                    pass
+            ",
+        );
+
+        let names = collect_unused_names(&source)?;
+        assert_eq!(names, Vec::<String>::new());
+        Ok(())
+    }
+
+    #[test]
+    fn skips_top_level_classes_without_exclusion_from_dunder_all() -> anyhow::Result<()> {
+        let no_dunder_all = dedent(
+            "
+            class PublicByDefault:
+                pass
+            ",
+        );
+        let names = collect_unused_names(&no_dunder_all)?;
+        assert_eq!(names, Vec::<String>::new());
+
+        let exported = dedent(
+            "
+            __all__ = [\"Exported\"]
+
+            class Exported:
+                pass
+            ",
+        );
+        let names = collect_unused_names(&exported)?;
+        assert_eq!(names, Vec::<String>::new());
+        Ok(())
+    }
+
+    #[test]
+    fn reports_top_level_classes_excluded_from_dunder_all() -> anyhow::Result<()> {
+        let source = dedent(
+            "
+            __all__ = [\"Exported\"]
+
+            class Exported:
+                pass
+
+            class Internal:
+                pass
+            ",
+        );
+
+        let name_kinds = collect_unused_name_kinds(&source)?;
+        assert_eq!(name_kinds, vec!["Internal:Class"]);
+        Ok(())
+    }
+
+    #[test]
+    fn skips_top_level_class_used_in_nested_scope() -> anyhow::Result<()> {
+        let source = dedent(
+            "
+            __all__ = []
+
+            class Internal:
+                pass
+
+            def f():
+                return Internal
+            ",
+        );
+
+        let names = collect_unused_names(&source)?;
+        assert_eq!(names, Vec::<String>::new());
         Ok(())
     }
 
@@ -583,6 +963,7 @@ mod tests {
             vec![UnusedBinding {
                 range: TextRange::new(outer_x_start, outer_x_start + TextSize::new(1)),
                 name: Name::new("x"),
+                kind: UnusedBindingKind::Local,
             }]
         );
         Ok(())
@@ -732,6 +1113,7 @@ mod tests {
             vec![UnusedBinding {
                 range: TextRange::new(assignment_start, assignment_start + TextSize::new(1)),
                 name: Name::new("a"),
+                kind: UnusedBindingKind::Local,
             }]
         );
         Ok(())
@@ -771,6 +1153,7 @@ mod tests {
             vec![UnusedBinding {
                 range: TextRange::new(value_start, value_start + TextSize::new(5)),
                 name: Name::new("value"),
+                kind: UnusedBindingKind::Local,
             }]
         );
         Ok(())
@@ -800,6 +1183,7 @@ mod tests {
             vec![UnusedBinding {
                 range: TextRange::new(final_x_start, final_x_start + TextSize::new(1)),
                 name: Name::new("x"),
+                kind: UnusedBindingKind::Local,
             }]
         );
         Ok(())

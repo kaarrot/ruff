@@ -2,7 +2,7 @@ use ruff_db::files::File;
 use ruff_python_ast::name::Name;
 use ruff_text_size::TextRange;
 use ty_python_semantic::types::ide_support::{
-    UnreachableKind, unreachable_ranges, unused_bindings,
+    UnreachableKind, UnusedBindingKind, unreachable_ranges, unused_bindings,
 };
 
 use crate::Db;
@@ -22,6 +22,8 @@ impl Hint {
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub enum HintKind {
     UnusedBinding(Name),
+    UnusedImport(Name),
+    UnusedClass(Name),
     UnreachableCode(UnreachableKind),
 }
 
@@ -29,6 +31,8 @@ impl HintKind {
     pub fn message(&self) -> String {
         match self {
             Self::UnusedBinding(name) => format!("`{name}` is unused"),
+            Self::UnusedImport(name) => format!("`{name}` is imported but unused"),
+            Self::UnusedClass(name) => format!("Class `{name}` is unused"),
             Self::UnreachableCode(UnreachableKind::Unconditional) => {
                 "Code is always unreachable".to_owned()
             }
@@ -58,7 +62,11 @@ pub fn hints(db: &dyn Db, file: File) -> Vec<Hint> {
         })
         .map(|binding| Hint {
             range: binding.range,
-            kind: HintKind::UnusedBinding(binding.name.clone()),
+            kind: match binding.kind {
+                UnusedBindingKind::Local => HintKind::UnusedBinding(binding.name.clone()),
+                UnusedBindingKind::Import => HintKind::UnusedImport(binding.name.clone()),
+                UnusedBindingKind::Class => HintKind::UnusedClass(binding.name.clone()),
+            },
         })
         .collect::<Vec<_>>();
 

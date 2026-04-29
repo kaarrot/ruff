@@ -66,6 +66,45 @@ def foo():
 }
 
 #[test]
+fn unused_import_and_class_have_unnecessary_hint_tags() -> Result<()> {
+    let _filter = filter_result_id();
+
+    let workspace_root = SystemPath::new("src");
+    let foo = SystemPath::new("src/foo.py");
+    let foo_content = "\
+import os
+from sys import path
+
+__all__ = [\"Exported\"]
+
+class Exported:
+    pass
+
+class Internal:
+    pass
+
+def foo():
+    class Local:
+        pass
+
+    return 0
+";
+
+    let mut server = TestServerBuilder::new()?
+        .with_workspace(workspace_root, None)?
+        .with_file(foo, foo_content)?
+        .build()
+        .wait_until_workspaces_are_initialized();
+
+    server.open_text_document(foo, foo_content, 1);
+    let diagnostics = server.document_diagnostic_request(foo, None);
+
+    assert_compact_json_snapshot!(diagnostics);
+
+    Ok(())
+}
+
+#[test]
 fn unreachable_code_has_unnecessary_hint_tag() -> Result<()> {
     let _filter = filter_result_id();
 
@@ -164,6 +203,37 @@ fn workspace_reports_unused_binding_hint_tag() -> Result<()> {
 def foo():
     x = 1
     return 0
+";
+
+    let mut server = TestServerBuilder::new()?
+        .with_workspace(
+            workspace_root,
+            Some(ClientOptions::default().with_diagnostic_mode(DiagnosticMode::Workspace)),
+        )?
+        .with_file(foo, foo_content)?
+        .build()
+        .wait_until_workspaces_are_initialized();
+
+    let diagnostics = server.workspace_diagnostic_request(None, None);
+
+    assert_compact_json_snapshot!(diagnostics);
+
+    Ok(())
+}
+
+#[test]
+fn workspace_reports_unused_import_and_class_hint_tags() -> Result<()> {
+    let _filter = filter_result_id();
+
+    let workspace_root = SystemPath::new("src");
+    let foo = SystemPath::new("src/foo.py");
+    let foo_content = "\
+import os
+
+__all__ = []
+
+class Internal:
+    pass
 ";
 
     let mut server = TestServerBuilder::new()?
