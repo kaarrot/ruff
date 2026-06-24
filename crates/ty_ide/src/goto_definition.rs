@@ -1,9 +1,12 @@
-use crate::goto::find_goto_target;
-use crate::{Db, NavigationTargets, RangedValue};
+use crate::goto::{GotoTarget, find_goto_target};
+use crate::symbols::SymbolKind;
+use crate::workspace_symbols::workspace_symbols;
+use crate::{Db, NavigationTarget, NavigationTargets, RangedValue};
 use ruff_db::files::{File, FileRange};
 use ruff_db::parsed::parsed_module;
+use ruff_python_ast as ast;
 use ruff_text_size::{Ranged, TextSize};
-use ty_python_semantic::{ImportAliasResolution, SemanticModel};
+use ty_python_semantic::{HasType, ImportAliasResolution, SemanticModel};
 
 /// Navigate to the definition of a symbol.
 ///
@@ -19,15 +22,120 @@ pub fn goto_definition(
     let module = parsed_module(db, file).load(db);
     let model = SemanticModel::new(db, file);
     let goto_target = find_goto_target(&model, &module, offset)?;
-    let definition_targets = goto_target
-        .definitions(&model, ImportAliasResolution::ResolveAliases)?
-        .goto_definition(&model, &goto_target)?
-        .into_navigation_targets(model.db());
+
+    // Precise, type-directed resolution.
+    let precise = goto_target
+        .definitions(&model, ImportAliasResolution::ResolveAliases)
+        .and_then(|definitions| definitions.goto_definition(&model, &goto_target))
+        .map(|definitions| definitions.into_navigation_targets(model.db()))
+        .filter(|targets| !targets.is_empty());
+
+    // When precise resolution finds nothing because the attribute's receiver has
+    // a dynamic (`Unknown`/`Any`) type — pervasive in un-annotated, legacy code —
+    // fall back to a project-wide, name-based search so navigation still lands
+    // somewhere useful (mirroring the behaviour of Pylance/Pyright).
+    let navigation_targets = match precise {
+        Some(targets) => targets,
+        None => name_based_fallback(db, &model, &goto_target)?,
+    };
 
     Some(RangedValue {
         range: FileRange::new(file, goto_target.range()),
-        value: definition_targets,
+        value: navigation_targets,
     })
+}
+
+/// Best-effort, name-based "go to definition" used only as a fallback when
+/// precise, type-directed resolution has already failed.
+///
+/// In dynamically-typed and legacy code the receiver of an attribute access is
+/// frequently inferred as `Unknown` (an object pulled from an untyped container,
+/// the result of an un-annotated function, and so on). When that happens ty
+/// cannot map `value.attr` onto a class member and navigation dead-ends. Rather
+/// than give up, we look up every symbol in the project whose name matches the
+/// identifier under the cursor and offer them all as candidates.
+///
+/// This is deliberately type-unsound — it can surface same-named symbols that
+/// are unrelated to the intended target — so it is gated on the receiver being
+/// dynamic (see [`dynamic_receiver_attr_name`]) and only ever runs after the
+/// precise path returns nothing. It therefore never overrides a correct,
+/// type-checked result.
+fn name_based_fallback(
+    db: &dyn Db,
+    model: &SemanticModel<'_>,
+    goto_target: &GotoTarget<'_>,
+) -> Option<NavigationTargets> {
+    if !name_fallback_enabled() {
+        return None;
+    }
+    let name = dynamic_receiver_attr_name(goto_target, model)?;
+
+    let targets: NavigationTargets = workspace_symbols(db, &name)
+        .into_iter()
+        // `workspace_symbols` matches fuzzily; keep only exact-name matches.
+        .filter(|info| info.symbol.name.as_ref() == name.as_str())
+        // Parameters/type-parameters are scoped to a single signature and are
+        // just noise as cross-project navigation targets.
+        .filter(|info| {
+            !matches!(
+                info.symbol.kind,
+                SymbolKind::Parameter | SymbolKind::TypeParameter
+            )
+        })
+        .map(|info| NavigationTarget {
+            file: info.file,
+            focus_range: info.symbol.name_range,
+            full_range: info.symbol.full_range,
+        })
+        .collect();
+
+    if targets.is_empty() {
+        None
+    } else {
+        Some(targets)
+    }
+}
+
+/// If `goto_target` is an attribute access `value.attr` whose receiver `value`
+/// has a dynamic (`Unknown`/`Any`/`Todo`) type, returns the attribute's name.
+///
+/// A dynamic receiver is exactly the situation ty cannot resolve a member on,
+/// and the only case in which the name-based fallback should engage: attributes
+/// of fully-known types that fail to resolve (e.g. a genuine typo, or a member
+/// that only exists on the metaclass) are intentionally left unresolved.
+fn dynamic_receiver_attr_name(
+    goto_target: &GotoTarget<'_>,
+    model: &SemanticModel<'_>,
+) -> Option<String> {
+    let expr = match goto_target {
+        GotoTarget::Expression(expr) | GotoTarget::Call { callable: expr, .. } => *expr,
+        _ => return None,
+    };
+    let ast::ExprRef::Attribute(attr) = expr else {
+        return None;
+    };
+    if attr.value.inferred_type(model)?.is_dynamic() {
+        Some(attr.attr.as_str().to_string())
+    } else {
+        None
+    }
+}
+
+/// Whether the name-based go-to-definition fallback is enabled.
+///
+/// Enabled by default. Set the `TY_GOTO_DEFINITION_NAME_FALLBACK` environment
+/// variable to `0`, `false`, `off`, or `no` to disable it — handy for A/B
+/// comparing precise-only resolution against the fallback. Because a
+/// language-server process inherits a fixed environment, toggling it takes
+/// effect on the next server restart.
+fn name_fallback_enabled() -> bool {
+    match std::env::var("TY_GOTO_DEFINITION_NAME_FALLBACK") {
+        Ok(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        Err(_) => true,
+    }
 }
 
 #[cfg(test)]
@@ -2130,6 +2238,125 @@ p = Point<CURSOR>(1, 2)
                 class Bar(metaclass=Foo): ...
                 Bar().<CURSOR>a
                 ",
+            )
+            .build();
+
+        assert_snapshot!(test.goto_definition(), @"No goto target found");
+    }
+
+    /// A name-based fallback kicks in when the receiver of an attribute access
+    /// has an `Unknown` type, so navigation still resolves to the matching
+    /// definition even though ty cannot type-check the access.
+    #[test]
+    fn goto_definition_name_fallback_on_dynamic_receiver() {
+        let test = CursorTest::builder()
+            .source(
+                "main.py",
+                "
+class Extension:
+    def local_install_path(self): ...
+
+def first(items):
+    return items[0]
+
+first([]).local_install_path<CURSOR>()
+",
+            )
+            .build();
+
+        assert_snapshot!(test.goto_definition(), @"
+        info[goto-definition]: Go to definition
+         --> main.py:8:11
+          |
+        8 | first([]).local_install_path()
+          |           ^^^^^^^^^^^^^^^^^^ Clicking here
+          |
+        info: Found 1 definition
+         --> main.py:3:9
+          |
+        3 |     def local_install_path(self): ...
+          |         ------------------
+          |
+        ");
+    }
+
+    /// The fallback surfaces *every* project symbol matching the name, so an
+    /// ambiguous attribute on a dynamic receiver yields multiple candidates.
+    #[test]
+    fn goto_definition_name_fallback_multiple_candidates() {
+        let test = CursorTest::builder()
+            .source(
+                "main.py",
+                "
+class A:
+    def render(self): ...
+
+class B:
+    def render(self): ...
+
+def untyped(x):
+    return x
+
+untyped(A()).render<CURSOR>()
+",
+            )
+            .build();
+
+        assert_snapshot!(test.goto_definition(), @"
+        info[goto-definition]: Go to definition
+          --> main.py:11:14
+           |
+        11 | untyped(A()).render()
+           |              ^^^^^^ Clicking here
+           |
+        info: Found 2 definitions
+         --> main.py:3:9
+          |
+        3 |     def render(self): ...
+          |         ------
+        4 |
+        5 | class B:
+        6 |     def render(self): ...
+          |         ------
+          |
+        ");
+    }
+
+    /// The fallback is gated on a *dynamic* receiver: a member that fails to
+    /// resolve on a fully-known type must not be papered over by a name search.
+    #[test]
+    fn goto_definition_name_fallback_skipped_for_known_receiver() {
+        let test = CursorTest::builder()
+            .source(
+                "main.py",
+                "
+class Other:
+    def only_on_other(self): ...
+
+class Known:
+    pass
+
+Known().only_on_other<CURSOR>()
+",
+            )
+            .build();
+
+        assert_snapshot!(test.goto_definition(), @"No goto target found");
+    }
+
+    /// A dynamic receiver with no project symbol of that name still resolves to
+    /// nothing — the fallback adds candidates, it does not invent them.
+    #[test]
+    fn goto_definition_name_fallback_no_match() {
+        let test = CursorTest::builder()
+            .source(
+                "main.py",
+                "
+def untyped(x):
+    return x
+
+untyped(1).method_that_does_not_exist<CURSOR>()
+",
             )
             .build();
 

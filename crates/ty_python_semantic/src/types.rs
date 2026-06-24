@@ -1308,7 +1308,12 @@ impl<'db> Type<'db> {
         }
     }
 
-    pub(crate) const fn is_dynamic(&self) -> bool {
+    /// Returns `true` if this type is dynamic (`Unknown`, `Any`, a `Todo`
+    /// placeholder, or a non-materialized divergent type).
+    ///
+    /// Exposed for IDE features such as the name-based go-to-definition
+    /// fallback, which only engages when an attribute's receiver is dynamic.
+    pub const fn is_dynamic(&self) -> bool {
         matches!(
             self,
             Type::Dynamic(_)

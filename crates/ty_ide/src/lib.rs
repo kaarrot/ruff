@@ -240,7 +240,6 @@ impl NavigationTargets {
         self.0.iter()
     }
 
-    #[cfg(test)]
     fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
